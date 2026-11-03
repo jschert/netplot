@@ -359,7 +359,7 @@ def _make_app_with_session(tmp_path, target: str = "127.0.0.1"):
     ``tmp_path`` isolates the persistence store so a persistent-session test
     can never leak ``sessions.json`` into the next test's boot restore.
     """
-    client = TestClient(create_app(data_dir=tmp_path))
+    client = TestClient(create_app(data_dir=tmp_path), base_url="http://localhost")
     client.__enter__()
     session = client.app.state.session_manager.create(target, interval_s=60.0)
     return client, session.id, session
@@ -576,7 +576,7 @@ def test_capture_skips_zero_sample_hop(tmp_path) -> None:
 
 
 def test_metrics_endpoint_status_and_content_type(tmp_path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         r = client.get("/metrics")
         assert r.status_code == 200
         assert r.headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
@@ -585,14 +585,14 @@ def test_metrics_endpoint_status_and_content_type(tmp_path) -> None:
 
 
 def test_metrics_endpoint_empty_has_no_samples(tmp_path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         parsed = parse_prom(client.get("/metrics").text)
         assert parsed["samples"] == []
 
 
 def test_metrics_endpoint_full_render_with_injected_samples(tmp_path) -> None:
     """End-to-end: inject samples, scrape /metrics, parse, assert values."""
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         # Data-only fixture: register the session directly (unstarted) so no
         # real probe/discovery task can add samples next to the injected set.
         session = client.app.state.session_manager.create(
@@ -624,7 +624,7 @@ def test_metrics_endpoint_full_render_with_injected_samples(tmp_path) -> None:
 
 def test_metrics_endpoint_multi_session_no_cross_contamination(tmp_path) -> None:
     """Two sessions produce distinct series keyed by session_id/target."""
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         s1 = client.app.state.session_manager.create("127.0.0.1", interval_s=60.0)
         s2 = client.app.state.session_manager.create("127.0.0.2", interval_s=60.0)
         sid1, sid2 = s1.id, s2.id
@@ -650,7 +650,7 @@ def test_metrics_endpoint_multi_session_no_cross_contamination(tmp_path) -> None
 
 def test_metrics_endpoint_deleted_session_gone_on_next_scrape(tmp_path) -> None:
     """After DELETE, the session's series vanish from /metrics."""
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         # Registered directly (unstarted): the DELETE lifecycle below is the
         # real endpoint/manager path, but no probe loop ever races the sample.
         session = client.app.state.session_manager.create(
@@ -672,7 +672,7 @@ def test_metrics_endpoint_deleted_session_gone_on_next_scrape(tmp_path) -> None:
 
 def test_metrics_endpoint_paused_session_state_label(tmp_path) -> None:
     """A paused session still emits series with state="paused"."""
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         session = client.app.state.session_manager.create(
             "127.0.0.1", interval_s=60.0
         )
@@ -708,7 +708,7 @@ def test_metrics_endpoint_paused_session_state_label(tmp_path) -> None:
 
 
 def test_metrics_endpoint_persistent_and_name_labels(tmp_path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         session = client.app.state.session_manager.create(
             "127.0.0.1", interval_s=60.0, name="my-trace", persistent=True
         )
@@ -732,7 +732,7 @@ def test_metrics_endpoint_persistent_and_name_labels(tmp_path) -> None:
 
 def test_metrics_endpoint_label_escaping_via_unsafe_target(tmp_path) -> None:
     """An unsafe target string injected directly must be escaped in labels."""
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         session = client.app.state.session_manager.create(
             "127.0.0.1", interval_s=60.0
         )

@@ -1,4 +1,4 @@
-"""InfluxDB 1.x interface-throughput query (backend-side, stdlib HTTP).
+"""InfluxDB 1.x interface-throughput query (backend-side, async HTTP).
 
 The optional timeline overlay fetches cumulative interface counters
 (``bytes_recv`` / ``bytes_sent`` on measurement ``net``, tagged by
@@ -11,10 +11,15 @@ Design points (bounded first version):
 - **No credentials.** Only no-auth HTTP(S) sources are supported; the URL
   validator in :mod:`netplot.settings` rejects userinfo. Nothing is
   created, stored, or sent that resembles a secret.
+- **Standard-library TLS trust.** HTTPS sources are verified with a
+  ``ssl.create_default_context()`` context — ``SSL_CERT_FILE`` /
+  ``SSL_CERT_DIR`` and the platform default roots, exactly what a plain
+  urllib HTTPS fetch honors — while implicit environment proxies stay
+  disabled (``trust_env=False``).
 - **No arbitrary queries.** The InfluxQL statement is built entirely from
   a fixed template plus a validated identifier (charset-restricted at
   settings time) and escaped again here via :func:`_quote`.
-- **No redirects.** A redirect refusal opener ensures a misconfigured or
+- **No redirects.** Explicitly rejecting non-2xx responses ensures a misconfigured or
   malicious endpoint cannot bounce the request elsewhere (and never to a
   different scheme).
 - **Counter-reset safe.** ``non_negative_derivative`` drops the negative
@@ -32,7 +37,7 @@ Design points (bounded first version):
   tag) instead of merged garbage.
 - **Missing data stays missing.** ``fill(none)`` omits empty buckets so
   gaps are never rendered as zero throughput.
-- **Bounded.** The request runs in a worker thread with a short timeout,
+- **Bounded.** The request has a cancellable total deadline,
   the time range is finite and span-capped (24 h, matching the largest
   timeline range), the bucket ladder bounds the point count (≤ 288
   points at the 24 h / 300 s step), and the response body is capped at
@@ -41,12 +46,13 @@ Design points (bounded first version):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
-import urllib.error
-import urllib.parse
-import urllib.request
+import ssl
+
+import httpx
 
 __all__ = [
     "INFLUX_TIMEOUT_S",
@@ -60,8 +66,7 @@ __all__ = [
 
 log = logging.getLogger("netplot.influx")
 
-#: Request timeout (seconds). Bounded so a dead endpoint cannot pin a
-#: worker thread; the overlay surfaces the failure instead.
+#: Total request deadline in seconds, including streaming the body.
 INFLUX_TIMEOUT_S = 5.0
 
 #: Largest accepted response body (1 MiB). A real /query answer for the
@@ -112,7 +117,9 @@ def _quote(value: str) -> str:
     return f"'{escaped}'"
 
 
-def build_query(interface: str, host_tag: str, step_s: int, start_s: float, end_s: float) -> str:
+def build_query(
+    interface: str, host_tag: str, step_s: int, start_s: float, end_s: float
+) -> str:
     """Build the InfluxQL SELECT for inbound/outbound derivative buckets.
 
     Pure function of its arguments so it is unit-testable without a
@@ -134,7 +141,7 @@ def build_query(interface: str, host_tag: str, step_s: int, start_s: float, end_
         for field, alias in ((_FIELD_RECV, "b_in"), (_FIELD_SENT, "b_out"))
     )
     return (
-        f"SELECT {fields} FROM \"{_MEASUREMENT}\" "
+        f'SELECT {fields} FROM "{_MEASUREMENT}" '
         f"WHERE {' AND '.join(clauses)} "
         f'GROUP BY time({step_s}s), "interface", "host" fill(none)'
     )
@@ -232,41 +239,53 @@ def parse_points(payload: object) -> list[dict]:
     return points
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Refuse every redirect (a redirect could change scheme/host)."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
-
-
-_OPENER = urllib.request.build_opener(_NoRedirectHandler)
-
-
-def fetch_query(
-    url: str, database: str, query: str, timeout_s: float = INFLUX_TIMEOUT_S
+async def fetch_query(
+    url: str,
+    database: str,
+    query: str,
+    timeout_s: float = INFLUX_TIMEOUT_S,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict:
-    """POST-free GET ``/query`` against the configured InfluxDB; return parsed JSON.
-
-    Runs blocking I/O — callers must keep it off the event loop
-    (``asyncio.to_thread``). Network/HTTP/parse failures raise
-    :class:`InfluxError` with a short, user-surfacing message.
-    """
+    """Fetch a size-bounded response with a cancellable total time budget."""
     endpoint = url.rstrip("/") + "/query"
-    querystring = urllib.parse.urlencode({"db": database, "q": query, "epoch": "ns"})
-    request = urllib.request.Request(
-        endpoint + "?" + querystring, headers={"Accept": "application/json"}
-    )
+    body = bytearray()
     try:
-        with _OPENER.open(request, timeout=timeout_s) as response:
-            # Bounded read: cap + 1 bytes so an oversized body is detected
-            # without ever buffering it.
-            body = response.read(MAX_RESPONSE_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        raise InfluxError(f"influx http error {exc.code}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise InfluxError(f"influx unreachable: {exc}") from exc
-    if len(body) > MAX_RESPONSE_BYTES:
-        raise InfluxError("influx response too large")
+        async with asyncio.timeout(timeout_s):
+            async with httpx.AsyncClient(
+                timeout=timeout_s,
+                follow_redirects=False,
+                # Preserve standard CA overrides without enabling environment proxies.
+                verify=ssl.create_default_context(),
+                trust_env=False,
+                transport=transport,
+            ) as client:
+                async with client.stream(
+                    "GET",
+                    endpoint,
+                    params={"db": database, "q": query, "epoch": "ns"},
+                    headers={
+                        "Accept": "application/json",
+                        "Accept-Encoding": "identity",
+                    },
+                ) as response:
+                    if not 200 <= response.status_code < 300:
+                        raise InfluxError(f"influx http error {response.status_code}")
+                    # Never decompress attacker-controlled bodies before enforcing
+                    # the cap. Influx JSON needs no content coding.
+                    if (
+                        response.headers.get("content-encoding", "identity").lower()
+                        != "identity"
+                    ):
+                        raise InfluxError(
+                            "influx returned unsupported content encoding"
+                        )
+                    async for chunk in response.aiter_raw():
+                        if len(body) + len(chunk) > MAX_RESPONSE_BYTES:
+                            raise InfluxError("influx response too large")
+                        body.extend(chunk)
+    except (httpx.HTTPError, TimeoutError, OSError) as exc:
+        raise InfluxError("influx unreachable or request deadline exceeded") from exc
     try:
         parsed = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -276,12 +295,11 @@ def fetch_query(
     return parsed
 
 
-def query_throughput(influx_cfg: dict, start_s: float, end_s: float) -> dict:
+async def query_throughput(influx_cfg: dict, start_s: float, end_s: float) -> dict:
     """End-to-end overlay query: validate range, fetch, normalize.
 
     Returns ``{"step_s": <int>, "points": [{t, in_mbps, out_mbps}]}``.
-    Raises :class:`InfluxError` on any failure. Blocking; the API layer
-    wraps it in ``asyncio.to_thread``.
+    Raises :class:`InfluxError` on any failure. Async; cancellation closes the upstream connection.
     """
     if not (math.isfinite(start_s) and math.isfinite(end_s)) or end_s < start_s:
         raise InfluxError("invalid time range")
@@ -291,5 +309,5 @@ def query_throughput(influx_cfg: dict, start_s: float, end_s: float) -> dict:
     query = build_query(
         influx_cfg["interface"], influx_cfg.get("host_tag") or "", step, start_s, end_s
     )
-    payload = fetch_query(influx_cfg["url"], influx_cfg["database"], query)
+    payload = await fetch_query(influx_cfg["url"], influx_cfg["database"], query)
     return {"step_s": step, "points": parse_points(payload)}

@@ -428,13 +428,26 @@ the configured interval; within a round all hop probes run concurrently.
   multiple series — a **502** telling the operator to set a ``host_tag``
   — instead of merged garbage). Missing buckets stay null (never zero).
   Bucket step ladder: 5 s (native source cadence) for spans ≤ 30 m,
-  60 s ≤ 6 h, else 300 s (24 h → 288 points). Stdlib HTTP with a
-  bounded timeout, run off the event loop; redirects refused; response
-  bodies capped at 1 MiB (bounded read); malformed payloads (wrong
-  shapes, non-finite timestamps, negative bandwidth) surface as
-  **502**-mapped errors, never uncaught exceptions. **400** on
-  missing/non-finite/negative params, ``start > end``, span > 24 h, or
-  when unconfigured; **502** when unreachable/erroring/ambiguous.
+  60 s ≤ 6 h, else 300 s (24 h → 288 points). **Transport contract:**
+  async HTTPX (``httpx.AsyncClient``, per request) with a **5 s total
+  deadline** (``INFLUX_TIMEOUT_S``) covering connect plus streaming the
+  whole body — cancelled cleanly, closing the upstream connection;
+  **no redirects** (``follow_redirects=False``); **no compression**
+  (``Accept-Encoding: identity`` and any non-identity ``Content-Encoding``
+  refused before the cap is enforced, so the **1 MiB cap applies to the
+  raw body**, ``MAX_RESPONSE_BYTES``); **no implicit proxies**
+  (``trust_env=False`` — environment proxy variables are ignored). HTTPS
+  sources verify with ``ssl.create_default_context()``, honoring
+  ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` and platform defaults.
+  Malformed payloads (wrong shapes,
+  non-finite timestamps, negative bandwidth) surface as **502**-mapped
+  errors, never uncaught exceptions. **400** on missing/non-numeric/
+  negative params, ``start > end``, span > 24 h, or when unconfigured;
+  **502** when unreachable/erroring/ambiguous. **Admission:** at most
+  **4 active throughput queries per process**
+  (``THROUGHPUT_CONCURRENCY_LIMIT``); a request that finds all slots held
+  gets **429** with ``Retry-After: 2`` instead of queueing, and a request
+  cancelled mid-flight (client disconnect included) releases its slot.
 - `GET /api/traces/{id}/events` → Server-Sent Events:
   - `retry: 1000` prelude, `event: ready` block.
   - `event: route` block once when discovery completes:
@@ -444,6 +457,15 @@ the configured interval; within a round all hop probes run concurrently.
     where `hop == 0` denotes the target (route pending/failed) and
     `hop >= 1` matches the route event's hop indexes (final hop = target).
   - `: keepalive` comments when idle.
+
+  **Admission + cleanup:** at most **8 subscribers per session**
+  (``MAX_SUBSCRIBERS_PER_SESSION``) and **32 SSE connections per
+  process** (``SSE_CONCURRENCY_LIMIT``). Beyond either bound the
+  endpoint returns **429** with ``Retry-After: 2`` rather than queueing
+  (both checks happen before the stream starts, so no 200 is sent for a
+  rejected subscriber). A client disconnect or task cancellation
+  releases both the process slot and the session subscription — streams
+  abandoned mid-response cannot wedge admission.
 
   Chosen over WebSocket: one-way push, simpler, native `EventSource` in the
   browser.

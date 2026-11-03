@@ -10,13 +10,18 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "jschert" }]
-dependencies = ["fastapi>=0.114", "uvicorn[standard]>=0.30"]
+dependencies = [
+    "fastapi>=0.114",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.28.1,<0.29",
+    # Security floor for HTTPX's TLS trust store.
+    "certifi>=2026.10.19",
+]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
-    "httpx>=0.27,<0.29",
-    "httpx2>=2",
+    "httpx2>=2.12.0",
 ]
 
 [project.scripts]

@@ -182,7 +182,7 @@ def test_normalize_influx_rejects_unsafe_identifiers(field: str, bad: str) -> No
 
 
 def _client(tmp_path) -> TestClient:
-    return TestClient(create_app(data_dir=tmp_path))
+    return TestClient(create_app(data_dir=tmp_path), base_url="http://localhost")
 
 
 def test_get_internal_settings_defaults(tmp_path) -> None:
@@ -321,7 +321,7 @@ def test_combined_put_failed_persist_leaves_runtime_and_disk_intact(
 
     monkeypatch.setattr(webmod, "save_settings", flaky_save)
     app = create_app(data_dir=tmp_path)
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(app, base_url="http://localhost", raise_server_exceptions=False)
     with client:
         seed = client.put(
             "/api/settings",

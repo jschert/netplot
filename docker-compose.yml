@@ -12,6 +12,10 @@
 #   NETPLOT_VERSION       image tag         (default: latest)
 #   NETPLOT_BIND_ADDRESS  host interface    (default: 127.0.0.1)
 #   NETPLOT_PORT          host port         (default: 8000)
+#   NETPLOT_ALLOWED_HOSTS exact Host values additionally accepted
+#                                           (default: localhost,127.0.0.1,::1)
+#   FORWARDED_ALLOW_IPS   direct peers whose X-Forwarded-Proto/-For
+#                         headers Uvicorn trusts (default: 127.0.0.1)
 #
 # The application has NO authentication: the loopback default is
 # deliberate. Bind the LAN explicitly (NETPLOT_BIND_ADDRESS) only on
@@ -26,6 +30,14 @@ services:
     ports:
       - "${NETPLOT_BIND_ADDRESS:-127.0.0.1}:${NETPLOT_PORT:-8000}:8000"
     restart: unless-stopped
+    environment:
+      NETPLOT_ALLOWED_HOSTS: "${NETPLOT_ALLOWED_HOSTS:-localhost,127.0.0.1,::1}"
+      # Native Uvicorn setting, passed through unchanged (no app-level
+      # wrapper): the direct peers allowed to rewrite scheme/client from
+      # X-Forwarded-Proto / X-Forwarded-For. Keep the narrow loopback
+      # default unless an authenticated reverse proxy fronts the backend
+      # from exactly one address — see the README "Reverse proxy" section.
+      FORWARDED_ALLOW_IPS: "${FORWARDED_ALLOW_IPS:-127.0.0.1}"
     # Persistent state lives in NETPLOT_DATA_DIR=/data (set in the
     # Dockerfile). The named volume keeps settings.json and background
     # session definitions across container recreation and upgrades;

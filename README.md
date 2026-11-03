@@ -92,11 +92,13 @@ lacks access or the selected tag is unavailable.
 All knobs are environment variables read by `docker-compose.yml`. Put them
 in a `.env` file next to it to make them stick:
 
-| Variable               | Default     | Purpose                                                |
-| ---------------------- | ----------- | ------------------------------------------------------ |
-| `NETPLOT_VERSION`      | `latest`    | Image tag to pull, e.g. `0.1.0`                        |
-| `NETPLOT_BIND_ADDRESS` | `127.0.0.1` | Host interface the published port binds to             |
-| `NETPLOT_PORT`         | `8000`      | Host port                                              |
+| Variable                | Default                     | Purpose                                                                   |
+| ----------------------- | --------------------------- | ------------------------------------------------------------------------- |
+| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.0`                                           |
+| `NETPLOT_BIND_ADDRESS`  | `127.0.0.1`                 | Host interface the published port binds to                                |
+| `NETPLOT_PORT`          | `8000`                      | Host port                                                                 |
+| `NETPLOT_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1`   | Extra exact Host values to accept, e.g. `netplot.example` (see *LAN access*) |
+| `FORWARDED_ALLOW_IPS`   | `127.0.0.1`                 | Uvicorn: direct peers whose `X-Forwarded-Proto`/`X-Forwarded-For` headers are trusted (see *Reverse proxy*) |
 
 ```dotenv
 # .env
@@ -141,13 +143,73 @@ networks you fully trust (e.g. an isolated lab VLAN), and never to the
 public internet:
 
 ```bash
-NETPLOT_BIND_ADDRESS=0.0.0.0 docker compose up -d        # all interfaces
-NETPLOT_BIND_ADDRESS=192.168.1.10 docker compose up -d   # one interface only
+NETPLOT_ALLOWED_HOSTS=192.168.1.10 NETPLOT_BIND_ADDRESS=0.0.0.0 docker compose up -d        # all interfaces
+NETPLOT_ALLOWED_HOSTS=192.168.1.10 NETPLOT_BIND_ADDRESS=192.168.1.10 docker compose up -d   # one interface only
 ```
 
-For a persistent LAN binding, set `NETPLOT_BIND_ADDRESS` in `.env`. The
+Set `NETPLOT_ALLOWED_HOSTS` to additional exact comma-separated hostnames/IPs clients
+use (no schemes, ports, or wildcards; IPv6 addresses without brackets). The
+loopback hosts `localhost,127.0.0.1,::1` are always allowed, including for
+the container health check. This also applies to native installs.
+Unlisted Host headers return 400; browser mutations from another origin
+return 403. CLI clients without an Origin header remain supported. For a
+reverse proxy, preserve Host and configure the externally visible hostname;
+only trust forwarded scheme headers from that proxy (see *Reverse proxy*
+below for the full setup). Shared deployments
+should use an authenticating reverse proxy and prevent direct backend access.
+Host/Origin validation does not provide user authentication.
+
+Throughput queries allow four concurrent requests per process and have a
+five-second total deadline; excess requests receive 429 with Retry-After.
+Event streams allow eight subscribers per trace and 32 per process, also
+returning 429 when full. Closing a stream releases its slot. Influx redirects,
+compressed responses, and environment-configured outbound proxies are disabled.
+
+For a persistent LAN binding, set both `NETPLOT_BIND_ADDRESS` and
+`NETPLOT_ALLOWED_HOSTS` in `.env`. The
 one-command overrides above do not persist; a later bare `docker compose
 up -d` uses the saved `.env` value or the loopback default.
+
+### Optional: reverse proxy (HTTPS front end)
+
+netplot itself serves plain HTTP, but an authenticating TLS reverse proxy can
+front it. The proxy is then the *only* component that should be able to reach
+the backend, and the backend needs two pieces of configuration:
+
+1. **`NETPLOT_ALLOWED_HOSTS`** must include the externally visible hostname,
+   and the proxy must **preserve the `Host` header as the browser sent it** —
+   including any non-default port (Host `netplot.example:8443` pairs with
+   Origin `https://netplot.example:8443`; the allowlist itself takes the
+   bare hostname `netplot.example`, never a scheme or port). Rewriting or
+   dropping the port gets the request rejected with 400/403.
+2. **`FORWARDED_ALLOW_IPS`** (Uvicorn's native setting — `docker-compose.yml`
+   passes it through) must name the proxy **exactly as the backend sees the
+   connection peer**, because the backend trusts `X-Forwarded-Proto: https`
+   (and `X-Forwarded-For`) only from that address. The proxy must send
+   `X-Forwarded-Proto: https`; without it, browser POST/PUT/DELETE requests
+   from the HTTPS page are rejected with 403 while GETs keep working.
+   With Docker published ports the peer is often the **container network
+   gateway** (e.g. `172.18.0.1`), not the proxy machine's LAN address —
+   check what the backend actually sees before configuring, and prefer an
+   exact IP (a CIDR is also accepted). Trust only that one proxy address;
+   `*` trusts every peer and must not be used.
+
+Both variables reach the container through Compose, so put them in `.env`
+next to `docker-compose.yml` and they apply on every `docker compose up -d`:
+
+```dotenv
+# .env
+NETPLOT_VERSION=0.1.0
+NETPLOT_ALLOWED_HOSTS=netplot.example
+FORWARDED_ALLOW_IPS=192.0.2.10
+```
+
+Keep the backend unreachable except from the proxy: leave
+`NETPLOT_BIND_ADDRESS` at its loopback default **on the proxy's Docker
+host**, or bind it to an interface only the proxy can reach. The proxy's
+authentication protects nothing if clients can bypass it and hit the
+no-auth backend directly — and note that Host/Origin validation is a
+browser boundary, not authentication.
 
 ### Stop and uninstall
 
@@ -273,7 +335,7 @@ policy, and `netplot-data` volume still come from the base file. A bare
 - `GET /api/settings/internal` / `PUT /api/settings/internal {cidrs: [...]}` manage the internal IP ranges (default RFC1918 + IPv6 ULA; other CIDRs editable, one per line in the settings dialog). Hops and the resolved target are classified server-side with the stdlib `ipaddress` module and annotated on the snapshot (`hops[].internal`, `target_internal`). The dashboard's **Mask internal DNS** toolbar toggle then replaces the DNS names of internal hosts with a neutral alias (`Internal host`) everywhere they are displayed — hop table, timeline labels, tab label/tooltips. The mask is display-only: IP addresses are never masked, and API/CSV payloads keep the real names. Persisted to `<data_dir>/settings.json` (atomic writes).
 - `GET /api/settings/influx` / `PUT /api/settings/influx {url, database, interface, host_tag}` configure the optional InfluxDB 1.x throughput overlay (generic, settings-only — no presets: url/database/interface all blank by default, and a non-empty URL requires an explicit database and interface; the dialog placeholders are just examples). http(s) only, no userinfo/query/fragments; identifiers are charset-restricted so they cannot break out of the InfluxQL string literal. No credentials are created, stored, or sent; only existing no-auth sources are supported in this bounded first version.
 - `PUT /api/settings {cidrs, influx}` is the combined transactional save the settings dialog's Save button sends: both sections validate, persist, and go live together — an invalid section (422) or a failed persist leaves runtime and `settings.json` untouched. The individual `GET/PUT /api/settings/internal|influx` endpoints remain; all settings writes are serialized server-side.
-- `GET /api/throughput?start=<epoch_s>&end=<epoch_s>` returns normalized interface throughput for the span: `{start, end, step_s, points: [{t, in_mbps, out_mbps}]}` (null Mbps = missing bucket, never zero). The server queries backend-side via stdlib HTTP (bounded timeout, off the event loop, redirects refused, response bodies capped at 1 MiB) using `non_negative_derivative(last(field), 1s)` over the `net` measurement's `bytes_recv`/`bytes_sent` counters — the fixed `1s` unit makes every bucket bytes/second regardless of the aggregation step, and `last()` reads the counter's end-of-bucket value (counter-reset safe). The counters are grouped by `time(step)` plus the interface/host tags so multiple hosts surface as an error instead of silently merging, bucketed by a step ladder (5 s native for short zooms, aggregated up to 300 s for 24 h; span capped at 24 h). 400 on malformed/unconfigured requests, 502 when InfluxDB is unreachable, ambiguous (set a host tag), or returns a malformed payload. The dashboard overlays it on the primary/target timeline only, behind a per-tab **Throughput** checkbox, on its own labeled Mbps axis with two distinguishable direction lines that break at missing buckets and cadence-sized gaps (never bridged, never zero); latency/loss rendering and focus drag are unchanged, and a missing/unreachable source surfaces in the legend without breaking the chart. Saving the Influx settings clears every tab's overlay data, invalidates in-flight responses, and refetches (or disables the toggle) accordingly.
+- `GET /api/throughput?start=<epoch_s>&end=<epoch_s>` returns normalized interface throughput for the span: `{start, end, step_s, points: [{t, in_mbps, out_mbps}]}` (null Mbps = missing bucket, never zero). The server queries backend-side via async HTTPX with a 5-second total deadline (connect plus the whole streamed body; cancellation closes the upstream connection), no redirects, no compression (raw response bodies capped at 1 MiB), and no environment-configured outbound proxies; HTTPS sources verify against the runtime's standard CA bundle. The query uses `non_negative_derivative(last(field), 1s)` over the `net` measurement's `bytes_recv`/`bytes_sent` counters — the fixed `1s` unit makes every bucket bytes/second regardless of the aggregation step, and `last()` reads the counter's end-of-bucket value (counter-reset safe). The counters are grouped by `time(step)` plus the interface/host tags so multiple hosts surface as an error instead of silently merging, bucketed by a step ladder (5 s native for short zooms, aggregated up to 300 s for 24 h; span capped at 24 h). 400 on malformed/unconfigured requests, 502 when InfluxDB is unreachable, ambiguous (set a host tag), or returns a malformed payload. The dashboard overlays it on the primary/target timeline only, behind a per-tab **Throughput** checkbox, on its own labeled Mbps axis with two distinguishable direction lines that break at missing buckets and cadence-sized gaps (never bridged, never zero); latency/loss rendering and focus drag are unchanged, and a missing/unreachable source surfaces in the legend without breaking the chart. Saving the Influx settings clears every tab's overlay data, invalidates in-flight responses, and refetches (or disables the toggle) accordingly.
 
 ## Notes
 

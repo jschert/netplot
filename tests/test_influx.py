@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import httpx
 import json
-from unittest import mock
+import shutil
+import ssl
+import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 from fastapi.testclient import TestClient
@@ -74,11 +80,7 @@ def test_build_query_escapes_quotes_defensively() -> None:
 
 
 def _influx_response(rows, columns=("time", "b_in", "b_out")) -> dict:
-    return {
-        "results": [
-            {"series": [{"columns": list(columns), "values": rows}]}
-        ]
-    }
+    return {"results": [{"series": [{"columns": list(columns), "values": rows}]}]}
 
 
 def test_parse_points_converts_bytes_per_s_to_mbps_and_ns_to_seconds() -> None:
@@ -135,8 +137,14 @@ def test_parse_points_malformed_payloads_raise_influx_error() -> None:
         {"results": [{"series": {"a": 1}}]},
         {"results": [{"series": [42]}]},  # series entry not an object
         {"results": [{"series": [[1, 2, 3]]}]},
-        {"results": [{"series": [{"columns": "time,b_in", "values": []}]}]},  # columns not a list
-        {"results": [{"series": [{"columns": ["time", "b_in", "b_out"], "values": "nope"}]}]},
+        {
+            "results": [{"series": [{"columns": "time,b_in", "values": []}]}]
+        },  # columns not a list
+        {
+            "results": [
+                {"series": [{"columns": ["time", "b_in", "b_out"], "values": "nope"}]}
+            ]
+        },
     ]
     for payload in bad_payloads:
         with pytest.raises(InfluxError):
@@ -196,7 +204,11 @@ def _simulate_query(samples, query, step_s):
                 if s1 >= s0:
                     row[2] = (s1 - s0) / dt * unit_s
         rows.append(row)
-    return {"results": [{"series": [{"columns": ["time", "b_in", "b_out"], "values": rows}]}]}
+    return {
+        "results": [
+            {"series": [{"columns": ["time", "b_in", "b_out"], "values": rows}]}
+        ]
+    }
 
 
 @pytest.mark.parametrize("step_s", [5, 10, 60, 300])
@@ -208,8 +220,7 @@ def test_derivative_reads_bytes_per_second_at_every_step(step_s) -> None:
     # 5/10/60/300×.
     rate = 125_000.0  # B/s == 1 Mbps
     samples = [
-        (i * 5, 1_000_000 + i * 5 * rate, 2_000_000 + i * 5 * rate)
-        for i in range(124)
+        (i * 5, 1_000_000 + i * 5 * rate, 2_000_000 + i * 5 * rate) for i in range(124)
     ]
     query = build_query("eth0", "", step_s, samples[0][0], samples[-1][0])
     assert 'non_negative_derivative(last("bytes_recv"), 1s)' in query
@@ -224,69 +235,219 @@ def test_derivative_reads_bytes_per_second_at_every_step(step_s) -> None:
 # ------------------------------------------------------------- fetch_query
 
 
-def test_fetch_query_builds_url_and_parses_json() -> None:
+class BytesStream(httpx.AsyncByteStream):
+    def __init__(self, body):
+        self.body = body
+
+    async def __aiter__(self):
+        yield self.body
+
+
+def test_fetch_query_builds_url_and_parses_json():
+    def handler(request):
+        assert str(request.url).startswith("http://h:8086/query?")
+        assert request.url.params["db"] == "telegraf"
+        assert request.url.params["epoch"] == "ns"
+        return httpx.Response(200, stream=BytesStream(b'{"results": []}'))
+
+    assert asyncio.run(
+        influx.fetch_query(
+            "http://h:8086/",
+            "telegraf",
+            "SELECT 1",
+            transport=httpx.MockTransport(handler),
+        )
+    ) == {"results": []}
+
+
+def test_fetch_query_unreachable_raises_influx_error():
+    def handler(request):
+        raise httpx.ConnectError("refused")
+
+    with pytest.raises(InfluxError, match="unreachable"):
+        asyncio.run(
+            influx.fetch_query(
+                "http://h:8086", "db", "q", transport=httpx.MockTransport(handler)
+            )
+        )
+
+
+def test_fetch_query_caps_response_bytes():
+    def handler(request):
+        return httpx.Response(
+            200, stream=BytesStream(b"x" * (influx.MAX_RESPONSE_BYTES + 1))
+        )
+
+    with pytest.raises(InfluxError, match="too large"):
+        asyncio.run(
+            influx.fetch_query(
+                "http://h:8086", "db", "q", transport=httpx.MockTransport(handler)
+            )
+        )
+
+
+# ------------------------------------- fetch_query over real HTTPS (TLS)
+
+
+def _self_signed_cert(tmp_path, name):
+    """Ephemeral self-signed cert + key for ``localhost`` / ``127.0.0.1``
+    via the openssl CLI (present on standard Linux/macOS dev and CI hosts).
+
+    Material lives only in ``tmp_path`` — never committed — and each cert
+    doubles as its own trust anchor when pointed at by ``SSL_CERT_FILE``.
+    """
+    cert, key = tmp_path / f"{name}-cert.pem", tmp_path / f"{name}-key.pem"
+    config = tmp_path / f"{name}-openssl.cnf"
+    config.write_text(
+        "[req]\n"
+        "distinguished_name = dn\n"
+        "x509_extensions = ext\n"
+        "prompt = no\n"
+        "[dn]\n"
+        f"CN = {name}\n"
+        "[ext]\n"
+        "subjectAltName = DNS:localhost, IP:127.0.0.1\n"
+        "basicConstraints = CA:TRUE\n"
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "2",
+            "-config",
+            str(config),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=15,
+    )
+    return cert, key
+
+
+class _QuietHTTPServer(HTTPServer):
+    """HTTPServer that swallows per-connection errors: the untrusted-cert
+    test fails TLS handshakes on purpose, and socketserver would otherwise
+    print tracebacks for them."""
+
+    def handle_error(self, request, client_address):
+        pass
+
+
+def _start_https_server(cert, key, captured):
+    """TLS-wrapped local HTTP server answering /query with a fixed body."""
+    body = json.dumps(
+        _influx_response([[1_700_000_000_000000000, 125000.0, 250000.0]])
+    ).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            captured["path"] = self.path
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = _QuietHTTPServer(("127.0.0.1", 0), Handler)
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(str(cert), str(key))
+    server.socket = tls.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@pytest.mark.integration
+def test_fetch_query_https_honors_ssl_cert_file_and_ignores_env_proxies(
+    tmp_path, monkeypatch
+) -> None:
+    """Real-TLS regression for the httpx move: an operator CA exported via
+    SSL_CERT_FILE must verify the endpoint (standard-library trust, as a
+    plain urllib fetch had), while implicit environment proxies stay
+    disabled — the dead HTTPS_PROXY below must never be used."""
+    if not shutil.which("openssl"):
+        pytest.skip("openssl binary not available on PATH")
+
+    cert, key = _self_signed_cert(tmp_path, "netplot-test-ca")
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+    # Nothing listens on port 9: honoring implicit proxies would fail the
+    # fetch; trust_env=False must connect to the local server directly.
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:9")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+
     captured: dict = {}
+    server = _start_https_server(cert, key, captured)
+    try:
+        payload = asyncio.run(
+            influx.fetch_query(
+                f"https://localhost:{server.server_address[1]}",
+                "telegraf",
+                "SELECT 1",
+            )
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
 
-    class FakeResponse:
-        status = 200
-
-        def read(self, n=-1):
-            return json.dumps(_influx_response([[0, 1.0, 2.0]])).encode()
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    def fake_open(req, timeout=None):
-        captured["url"] = req.full_url
-        captured["timeout"] = timeout
-        return FakeResponse()
-
-    with mock.patch.object(influx._OPENER, "open", new=fake_open):
-        payload = influx.fetch_query("http://h:8086/", "telegraf", "SELECT 1")
-    assert captured["url"].startswith("http://h:8086/query?")
-    assert "db=telegraf" in captured["url"]
-    assert "epoch=ns" in captured["url"]
-    assert captured["timeout"] == influx.INFLUX_TIMEOUT_S
-    assert payload["results"]
+    # Successful bounded JSON consumption end to end over verified TLS.
+    assert payload == _influx_response(
+        [[1_700_000_000_000000000, 125000.0, 250000.0]]
+    )
+    assert "db=telegraf" in captured["path"]
+    assert "epoch=ns" in captured["path"]
 
 
-def test_fetch_query_unreachable_raises_influx_error() -> None:
-    import urllib.error
+@pytest.mark.integration
+def test_fetch_query_https_rejects_certificate_outside_trust_store(
+    tmp_path, monkeypatch
+) -> None:
+    """Strict verification is preserved: a server certificate NOT anchored
+    in SSL_CERT_FILE (nor in the platform roots) is rejected at TLS before
+    any body is consumed — surfaced as the usual InfluxError, never
+    silently accepted."""
+    if not shutil.which("openssl"):
+        pytest.skip("openssl binary not available on PATH")
 
-    with mock.patch.object(
-        influx._OPENER,
-        "open",
-        side_effect=urllib.error.URLError("refused"),
-    ), pytest.raises(InfluxError, match="unreachable"):
-        influx.fetch_query("http://h:8086", "telegraf", "SELECT 1")
+    anchor, _ = _self_signed_cert(tmp_path, "netplot-trusted-ca")
+    cert, key = _self_signed_cert(tmp_path, "netplot-untrusted")  # different key
+    monkeypatch.setenv("SSL_CERT_FILE", str(anchor))
 
+    captured: dict = {}
+    server = _start_https_server(cert, key, captured)
+    try:
+        with pytest.raises(InfluxError, match="unreachable"):
+            asyncio.run(
+                influx.fetch_query(
+                    f"https://localhost:{server.server_address[1]}",
+                    "telegraf",
+                    "SELECT 1",
+                )
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
 
-def test_fetch_query_caps_response_bytes() -> None:
-    class BigResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def read(self, n=-1):
-            assert n == influx.MAX_RESPONSE_BYTES + 1  # bounded read
-            return b"x" * (influx.MAX_RESPONSE_BYTES + 1)
-
-    with mock.patch.object(
-        influx._OPENER, "open", new=lambda req, timeout=None: BigResponse()
-    ), pytest.raises(InfluxError, match="too large"):
-        influx.fetch_query("http://h:8086", "telegraf", "SELECT 1")
+    assert "path" not in captured  # rejected at TLS; no HTTP request served
 
 
 # ------------------------------------------------------------ the endpoint
 
 
 def _configured_client(tmp_path) -> TestClient:
-    client = TestClient(create_app(data_dir=tmp_path))
+    client = TestClient(create_app(data_dir=tmp_path), base_url="http://localhost")
     with client:
         put = client.put(
             "/api/settings/influx",
@@ -301,7 +462,7 @@ def _configured_client(tmp_path) -> TestClient:
 
 
 def test_throughput_unconfigured_returns_400(tmp_path) -> None:
-    client = TestClient(create_app(data_dir=tmp_path))
+    client = TestClient(create_app(data_dir=tmp_path), base_url="http://localhost")
     with client:
         r = client.get("/api/throughput?start=0&end=60")
         assert r.status_code == 400
@@ -316,7 +477,7 @@ def test_throughput_returns_normalized_points(tmp_path, monkeypatch) -> None:
     }
     captured: dict = {}
 
-    def fake_query(cfg, start_s, end_s):
+    async def fake_query(cfg, start_s, end_s):
         captured["cfg"] = cfg
         captured["span"] = (start_s, end_s)
         return fixture
@@ -338,7 +499,7 @@ def test_throughput_returns_normalized_points(tmp_path, monkeypatch) -> None:
 def test_throughput_502_on_influx_error(tmp_path, monkeypatch) -> None:
     client = _configured_client(tmp_path)
 
-    def boom(cfg, start_s, end_s):
+    async def boom(cfg, start_s, end_s):
         raise InfluxError("influx unreachable: [Errno 61] Connection refused")
 
     monkeypatch.setattr("netplot.web.influx_mod.query_throughput", boom)
@@ -380,8 +541,10 @@ def test_query_throughput_end_to_end_against_local_http_server(tmp_path) -> None
             captured["path"] = self.path
             body = json.dumps(
                 _influx_response(
-                    [[1_700_000_000_000000000, 125000.0, 250000.0],
-                     [1_700_000_005_000000000, None, None]]
+                    [
+                        [1_700_000_000_000000000, 125000.0, 250000.0],
+                        [1_700_000_005_000000000, None, None],
+                    ]
                 )
             ).encode()
             self.send_response(200)
@@ -398,7 +561,7 @@ def test_query_throughput_end_to_end_against_local_http_server(tmp_path) -> None
     thread.start()
     try:
         port = server.server_address[1]
-        client = TestClient(create_app(data_dir=tmp_path))
+        client = TestClient(create_app(data_dir=tmp_path), base_url="http://localhost")
         with client:
             put = client.put(
                 "/api/settings/influx",
@@ -413,7 +576,11 @@ def test_query_throughput_end_to_end_against_local_http_server(tmp_path) -> None
             assert r.status_code == 200
             body = r.json()
             assert body["step_s"] == 5
-            assert body["points"][0] == {"t": 1700000000.0, "in_mbps": 1.0, "out_mbps": 2.0}
+            assert body["points"][0] == {
+                "t": 1700000000.0,
+                "in_mbps": 1.0,
+                "out_mbps": 2.0,
+            }
             assert body["points"][1]["in_mbps"] is None  # gap preserved, not zeroed
             assert "db=telegraf" in captured["path"]
             assert "epoch=ns" in captured["path"]

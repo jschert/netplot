@@ -17,7 +17,7 @@ from netplot.web import create_app
 
 
 def test_post_trace_creates_running_session() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         r = client.post("/api/traces", json={"target": "127.0.0.1", "interval_s": 2.5})
         assert r.status_code == 201
         body = r.json()
@@ -38,33 +38,33 @@ def test_post_trace_creates_running_session() -> None:
 
 
 def test_post_trace_defaults_interval_to_2_5() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         r = client.post("/api/traces", json={"target": "example.com"})
         assert r.status_code == 201
         assert r.json()["interval_s"] == 2.5
 
 
 def test_post_trace_422_on_flag_target() -> None:
-    client = TestClient(create_app(), raise_server_exceptions=False)
+    client = TestClient(create_app(), base_url="http://localhost", raise_server_exceptions=False)
     r = client.post("/api/traces", json={"target": "-n", "interval_s": 2.5})
     assert r.status_code == 422
 
 
 def test_post_trace_422_on_shell_metachar_target() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(), base_url="http://localhost")
     r = client.post("/api/traces", json={"target": "host; rm -rf /", "interval_s": 2.5})
     assert r.status_code == 422
 
 
 def test_post_trace_422_on_short_interval() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(), base_url="http://localhost")
     r = client.post("/api/traces", json={"target": "127.0.0.1", "interval_s": 0.5})
     assert r.status_code == 422
 
 
 @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
 def test_post_trace_422_on_non_finite_interval(literal: str) -> None:
-    client = TestClient(create_app(), raise_server_exceptions=False)
+    client = TestClient(create_app(), base_url="http://localhost", raise_server_exceptions=False)
     # JSON clients reject non-standard non-finite values before the request is
     # sent, so exercise the server parser with the wire representation.
     body = f'{{"target":"127.0.0.1","interval_s":{literal}}}'
@@ -75,13 +75,13 @@ def test_post_trace_422_on_non_finite_interval(literal: str) -> None:
 
 
 def test_post_trace_422_on_missing_target() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(), base_url="http://localhost")
     r = client.post("/api/traces", json={"interval_s": 2.5})
     assert r.status_code == 422
 
 
 def test_list_traces_returns_summary_shape() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         client.post("/api/traces", json={"target": "127.0.0.1", "interval_s": 2.0})
         client.post("/api/traces", json={"target": "::1", "interval_s": 3.0})
 
@@ -122,7 +122,7 @@ def test_post_trace_409_when_session_cap_reached() -> None:
     """
     from netplot.session import MAX_SESSIONS
 
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         for i in range(MAX_SESSIONS):
             r = client.post(
                 "/api/traces",
@@ -236,7 +236,7 @@ def _create_then(
 
 
 def test_pause_sets_state_and_returns_summary() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         r = client.post(f"/api/traces/{sid}/pause")
         assert r.status_code == 200
@@ -246,13 +246,13 @@ def test_pause_sets_state_and_returns_summary() -> None:
 
 
 def test_pause_returns_404_for_unknown_session() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(), base_url="http://localhost")
     r = client.post("/api/traces/deadbeef/pause")
     assert r.status_code == 404
 
 
 def test_pause_returns_409_when_already_paused() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         r1 = client.post(f"/api/traces/{sid}/pause")
         assert r1.status_code == 200
@@ -261,7 +261,7 @@ def test_pause_returns_409_when_already_paused() -> None:
 
 
 def test_resume_sets_state_back_to_running() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         client.post(f"/api/traces/{sid}/pause")
         r = client.post(f"/api/traces/{sid}/resume")
@@ -270,13 +270,13 @@ def test_resume_sets_state_back_to_running() -> None:
 
 
 def test_resume_returns_404_for_unknown_session() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(), base_url="http://localhost")
     r = client.post("/api/traces/deadbeef/resume")
     assert r.status_code == 404
 
 
 def test_resume_returns_409_when_already_running() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         # Session is already running after creation.
         r = client.post(f"/api/traces/{sid}/resume")
@@ -293,7 +293,7 @@ def test_resume_returns_409_when_already_running() -> None:
 
 
 def test_pause_response_carries_paused_at() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         before = time.time()
         r = client.post(f"/api/traces/{sid}/pause")
@@ -307,7 +307,7 @@ def test_pause_response_carries_paused_at() -> None:
 
 
 def test_snapshot_carries_paused_at_only_while_paused() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         # Running: no pause instant.
         snap = client.get(f"/api/traces/{sid}/snapshot").json()
@@ -326,7 +326,7 @@ def test_snapshot_carries_paused_at_only_while_paused() -> None:
 
 
 def test_list_summary_carries_paused_at() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         client.post(f"/api/traces/{sid}/pause")
         items = client.get("/api/traces").json()
@@ -339,7 +339,7 @@ def test_list_summary_carries_paused_at() -> None:
 
 
 def test_delete_removes_session() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         r = client.delete(f"/api/traces/{sid}")
         assert r.status_code == 204
@@ -351,7 +351,7 @@ def test_delete_removes_session() -> None:
 
 
 def test_delete_returns_404_for_unknown_session() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(), base_url="http://localhost")
     r = client.delete("/api/traces/deadbeef")
     assert r.status_code == 404
 
@@ -360,7 +360,7 @@ def test_delete_returns_404_for_unknown_session() -> None:
 
 
 def test_snapshot_returns_404_for_unknown_session() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(), base_url="http://localhost")
     r = client.get("/api/traces/deadbeef/snapshot")
     assert r.status_code == 404
 
@@ -371,7 +371,7 @@ def test_snapshot_reads_live_buffers_on_probe_event_loop(
     hop: int | None, focus: int
 ) -> None:
     """A real deque rejects off-loop reads, without relying on race timing."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         client.post(f"/api/traces/{sid}/pause")
         session = client.app.state.session_manager.get(sid)
@@ -406,7 +406,7 @@ def test_snapshot_reads_live_buffers_on_probe_event_loop(
 
 
 def test_snapshot_payload_shape_for_empty_session() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         client.post(f"/api/traces/{sid}/pause")  # stop the probe loop
 
@@ -441,7 +441,7 @@ def test_snapshot_payload_shape_for_empty_session() -> None:
 
 
 def test_snapshot_focus_query_param_overrides_default() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         client.post(f"/api/traces/{sid}/pause")
 
@@ -456,7 +456,7 @@ def test_snapshot_focus_query_param_overrides_default() -> None:
 
 @pytest.mark.parametrize("focus", ["-1", "nan", "inf", "-inf"])
 def test_snapshot_rejects_invalid_focus(focus: str) -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         client.post(f"/api/traces/{sid}/pause")
         assert (
@@ -465,7 +465,7 @@ def test_snapshot_rejects_invalid_focus(focus: str) -> None:
 
 
 def test_snapshot_reflects_injected_samples() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         app = client.app
         session = app.state.session_manager.get(sid)
@@ -495,14 +495,14 @@ def test_snapshot_reflects_injected_samples() -> None:
 
 
 def test_history_returns_404_for_unknown_session() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(), base_url="http://localhost")
     r = client.get("/api/traces/deadbeef/history?hop=0&start=0&end=9999")
     assert r.status_code == 404
 
 
 def test_history_payload_shape_and_clamping() -> None:
     """hop=0 returns the target stream, clamped to [start, end], ascending."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         session = client.app.state.session_manager.get(sid)
         client.post(f"/api/traces/{sid}/pause")
@@ -534,7 +534,7 @@ def test_history_payload_shape_and_clamping() -> None:
 
 def test_history_clamps_to_start_end_window() -> None:
     """samples outside [start, end] are excluded; earliest_t is unaffected."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         session = client.app.state.session_manager.get(sid)
         client.post(f"/api/traces/{sid}/pause")
@@ -560,7 +560,7 @@ def test_history_clamps_to_start_end_window() -> None:
 
 def test_history_sorts_out_of_order_retained_samples() -> None:
     """The wire contract remains timestamp-ascending even for odd writes."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         session = client.app.state.session_manager.get(sid)
         client.post(f"/api/traces/{sid}/pause")
@@ -575,7 +575,7 @@ def test_history_sorts_out_of_order_retained_samples() -> None:
 
 def test_history_empty_stream_returns_null_earliest_and_empty_samples() -> None:
     """Brand-new session: earliest_t null, samples [], 200 (not 404)."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         client.post(f"/api/traces/{sid}/pause")
         now = time.time()
@@ -591,7 +591,7 @@ def test_history_hop_param_returns_per_hop_stream() -> None:
     from netplot.session import Hop
     from netplot.session import Sample as NpSample
 
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         session = client.app.state.session_manager.get(sid)
         client.post(f"/api/traces/{sid}/pause")
@@ -612,7 +612,7 @@ def test_history_hop_param_returns_per_hop_stream() -> None:
 
 def test_history_unknown_hop_returns_404() -> None:
     """hop>=1 that doesn't match a discovered route hop → 404."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         client.post(f"/api/traces/{sid}/pause")
         # Route pending → no hops → hop=1 is unknown.
@@ -634,7 +634,7 @@ def test_history_target_covered_hop0_and_final_hop_share_stream() -> None:
     from netplot.session import Hop
     from netplot.session import Sample as NpSample
 
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         session = client.app.state.session_manager.get(sid)
         client.post(f"/api/traces/{sid}/pause")
@@ -672,7 +672,7 @@ def test_history_target_covered_hop0_and_final_hop_share_stream() -> None:
     ],
 )
 def test_history_malformed_params_return_400(query: str, detail_substr: str) -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         r = client.get(f"/api/traces/{sid}/history?{query}")
         assert r.status_code == 400, f"{query} -> {r.status_code} {r.text}"
@@ -681,7 +681,7 @@ def test_history_malformed_params_return_400(query: str, detail_substr: str) -> 
 
 def test_history_non_finite_params_return_400() -> None:
     """NaN/Infinity are parsed by float() but rejected by the finite check."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         r = client.get(f"/api/traces/{sid}/history?hop=0&start=NaN&end=100")
         assert r.status_code == 400
@@ -689,7 +689,7 @@ def test_history_non_finite_params_return_400() -> None:
 
 
 def test_history_unsupported_resolution_returns_400() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         r = client.get(
             f"/api/traces/{sid}/history?hop=0&start=0&end=9999&resolution=bucketed"
@@ -704,7 +704,7 @@ def test_history_unsupported_resolution_returns_400() -> None:
 
 def test_history_works_while_paused_and_while_running() -> None:
     """Server buffers are authoritative regardless of probe-loop state."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         session = client.app.state.session_manager.get(sid)
         # Pause FIRST so no background probe round can land between the
@@ -734,7 +734,7 @@ def test_history_is_bounded_by_server_retention() -> None:
     from netplot.session import SAMPLE_CAP
     from netplot.session import Sample as NpSample
 
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         session = client.app.state.session_manager.get(sid)
         client.post(f"/api/traces/{sid}/pause")
@@ -753,7 +753,7 @@ def test_history_is_bounded_by_server_retention() -> None:
 def test_history_snapshot_is_decoupled_from_live_deques() -> None:
     """Mutating the deque after the history capture must not change the
     returned payload (same immutability contract as export_snapshot)."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         session = client.app.state.session_manager.get(sid)
         client.post(f"/api/traces/{sid}/pause")
@@ -782,13 +782,13 @@ def test_history_snapshot_is_decoupled_from_live_deques() -> None:
 
 
 def test_export_returns_404_for_unknown_session() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(), base_url="http://localhost")
     r = client.get("/api/traces/deadbeef/export")
     assert r.status_code == 404
 
 
 def test_export_returns_400_for_unsupported_format() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         r = client.get(f"/api/traces/{sid}/export?format=json")
         assert r.status_code == 400
@@ -811,7 +811,7 @@ def test_export_csv_shape_and_loss_encoding() -> None:
     Target-only (route pending): samples export under hop 0 with the
     resolved target IP/DNS columns.
     """
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         app = client.app
         session = app.state.session_manager.get(sid)
@@ -863,7 +863,7 @@ def test_export_csv_route_hops_and_target_dedup() -> None:
     from netplot.session import Hop
     from netplot.session import Sample as NpSample
 
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         app = client.app
         session = app.state.session_manager.get(sid)
@@ -900,7 +900,7 @@ def test_export_csv_silent_tail_emits_target_as_hop_0() -> None:
     from netplot.session import Hop
     from netplot.session import Sample as NpSample
 
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         app = client.app
         session = app.state.session_manager.get(sid)
@@ -933,7 +933,7 @@ def test_export_csv_silent_tail_emits_target_as_hop_0() -> None:
 def test_export_works_while_running_and_while_paused() -> None:
     """Export is independent of probe-loop state: a paused session's buffers
     are still authoritative and produce the same rows as while running."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         app = client.app
         session = app.state.session_manager.get(sid)
@@ -952,7 +952,7 @@ def test_export_works_while_running_and_while_paused() -> None:
 
 
 def test_export_filename_sanitizes_unsafe_target() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         # A target with shell metacharacters is rejected at create time, so
         # inject an unsafe label directly to exercise the sanitizer.
         sid = _create_then(client)
@@ -967,7 +967,7 @@ def test_export_filename_sanitizes_unsafe_target() -> None:
 
 def test_export_csv_quotes_and_neutralizes_formula_text() -> None:
     """CSV syntax and spreadsheet formula text cannot escape their cells."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         session = client.app.state.session_manager.get(sid)
         client.post(f"/api/traces/{sid}/pause")
@@ -988,7 +988,7 @@ def test_export_csv_quotes_and_neutralizes_formula_text() -> None:
 
 
 def test_export_empty_session_returns_header_only() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         client.post(f"/api/traces/{sid}/pause")
         text = client.get(f"/api/traces/{sid}/export?format=csv").text
@@ -1014,7 +1014,7 @@ def test_export_returns_429_when_concurrency_slots_are_held() -> None:
     the test simulates held slots by decrementing the same counter. This is
     load-bearing: it pins the exact contract the endpoint relies on.
     """
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         sem = client.app.state.export_semaphore
         assert sem._value == 2
@@ -1033,7 +1033,7 @@ def test_export_returns_429_when_concurrency_slots_are_held() -> None:
 
 def test_export_succeeds_with_one_slot_free_under_one_held() -> None:
     """One slot held -> the second concurrent export still succeeds."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         sem = client.app.state.export_semaphore
         sem._value = 1  # one slot held
@@ -1049,7 +1049,7 @@ def test_export_succeeds_with_one_slot_free_under_one_held() -> None:
 
 def test_export_semaphore_is_released_after_normal_path() -> None:
     """A successful export must release its slot so subsequent requests work."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         sem = client.app.state.export_semaphore
         assert sem._value == 2
@@ -1064,7 +1064,7 @@ def test_export_semaphore_is_released_after_error_path() -> None:
     AND a 400 (raised before acquire) must not consume a slot either — both
     reject before the semaphore is touched. A successful export after them
     still finds the full budget available."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         sem = client.app.state.export_semaphore
         client.get("/api/traces/deadbeef/export")  # 404, pre-acquire
@@ -1090,7 +1090,7 @@ def test_export_snapshot_is_decoupled_from_live_deques() -> None:
     """Mutating the deque after capture must not change the serialized CSV."""
     from netplot.web import _samples_csv_from_snapshot
 
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         session = client.app.state.session_manager.get(sid)
         client.post(f"/api/traces/{sid}/pause")
@@ -1116,7 +1116,7 @@ def test_export_snapshot_rows_are_immutable_tuples() -> None:
     """The snapshot contains tuples of immutable scalars (no deque refs)."""
     from netplot.session import Sample as NpSample
 
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         session = client.app.state.session_manager.get(sid)
         session.target_ip = "127.0.0.1"
@@ -1228,7 +1228,7 @@ def test_safe_csv_text_treats_none_as_empty_string() -> None:
 
 
 def test_sse_endpoint_returns_404_for_unknown_session() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(), base_url="http://localhost")
     r = client.get("/api/traces/deadbeef/events")
     assert r.status_code == 404
 
@@ -1255,7 +1255,7 @@ def test_probe_loopback_via_session_api() -> None:
     if not shutil.which("ping"):
         pytest.skip("ping binary not available on PATH")
 
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         r = client.post("/api/traces", json={"target": "127.0.0.1", "interval_s": 1.0})
         assert r.status_code == 201
         sid = r.json()["id"]
@@ -1279,7 +1279,7 @@ def test_probe_loopback_via_session_api() -> None:
 
 
 def test_snapshot_hop_param_returns_per_hop_stats() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         app = client.app
         session = app.state.session_manager.get(sid)
@@ -1319,7 +1319,7 @@ def test_snapshot_hop_param_returns_per_hop_stats() -> None:
 
 
 def test_snapshot_hop_param_returns_404_for_unknown_hop() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         client.post(f"/api/traces/{sid}/pause")
         r = client.get(f"/api/traces/{sid}/snapshot?hop=99")
@@ -1328,7 +1328,7 @@ def test_snapshot_hop_param_returns_404_for_unknown_hop() -> None:
 
 def test_snapshot_route_state_transitions_to_ready() -> None:
     """Smoke that the snapshot's route_state reflects a fake-injected route."""
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         app = client.app
         session = app.state.session_manager.get(sid)
@@ -1371,7 +1371,7 @@ def test_snapshot_route_state_transitions_to_ready() -> None:
 
 
 def test_snapshot_exposes_target_dns_when_set() -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
         app = client.app
         session = app.state.session_manager.get(sid)
@@ -1398,7 +1398,7 @@ def test_route_discovery_loopback_end_to_end() -> None:
     if not shutil.which("traceroute"):
         pytest.skip("traceroute binary not available on PATH")
 
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), base_url="http://localhost") as client:
         r = client.post("/api/traces", json={"target": "127.0.0.1", "interval_s": 1.0})
         assert r.status_code == 201
         sid = r.json()["id"]

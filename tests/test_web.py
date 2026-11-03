@@ -6,7 +6,7 @@ from netplot import cli, web
 
 
 def test_root_dashboard_contains_controls() -> None:
-    client = TestClient(web.app)
+    client = TestClient(web.app, base_url="http://localhost")
 
     response = client.get("/")
 
@@ -77,12 +77,12 @@ def test_root_dashboard_contains_controls() -> None:
 
 
 def test_dashboard_table_headers_are_associated_with_columns() -> None:
-    body = TestClient(web.app).get("/").text
+    body = TestClient(web.app, base_url="http://localhost").get("/").text
     assert body.count('scope="col"') == 10
 
 
 def test_healthz_returns_expected_payload() -> None:
-    client = TestClient(web.app)
+    client = TestClient(web.app, base_url="http://localhost")
 
     response = client.get("/healthz")
 
@@ -92,7 +92,7 @@ def test_healthz_returns_expected_payload() -> None:
 
 def test_static_assets_are_served() -> None:
     """The Slice 4 UI ships as package static files; verify they are wired."""
-    client = TestClient(web.app)
+    client = TestClient(web.app, base_url="http://localhost")
 
     for name, expected_ct in (
         ("app.js", "javascript"),

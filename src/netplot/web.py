@@ -29,6 +29,7 @@ from .persistence import (
     default_data_dir,
     sanitize_name,
 )
+from .security import BrowserBoundaryMiddleware
 from .session import (
     _SESSION_CLOSED,
     DEFAULT_FOCUS_S,
@@ -38,6 +39,7 @@ from .session import (
     SessionManager,
     SessionMutationPending,
     SessionNotRegistered,
+    SubscriberLimitReached,
 )
 from .settings import (
     load_settings,
@@ -68,6 +70,8 @@ _INDEX_HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
 # operation, not a hot path — requests that cannot acquire a slot immediately
 # get HTTP 429 with a short Retry-After so the dashboard can retry cleanly.
 EXPORT_CONCURRENCY_LIMIT = 2
+THROUGHPUT_CONCURRENCY_LIMIT = 4
+SSE_CONCURRENCY_LIMIT = 32
 
 # Seconds the client should wait before retrying a 429'd export. Short and
 # fixed: exports finish in well under a second each, so a 2 s backoff covers
@@ -246,6 +250,8 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     # requests. Exposed on ``app.state`` purely so tests can pre-acquire
     # both slots deterministically to exercise the 429 path.
     export_semaphore = asyncio.Semaphore(EXPORT_CONCURRENCY_LIMIT)
+    throughput_semaphore = asyncio.Semaphore(THROUGHPUT_CONCURRENCY_LIMIT)
+    sse_semaphore = asyncio.Semaphore(SSE_CONCURRENCY_LIMIT)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -266,6 +272,9 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             await manager.shutdown()
 
     app = FastAPI(title="netplot", lifespan=lifespan)
+    app.add_middleware(BrowserBoundaryMiddleware)
+    app.state.throughput_semaphore = throughput_semaphore
+    app.state.sse_semaphore = sse_semaphore
     app.state.session_manager = manager
     app.state.export_semaphore = export_semaphore
 
@@ -401,8 +410,8 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     async def throughput(start: str | None = None, end: str | None = None) -> dict:
         """Inbound/outbound interface throughput (Mbps) for ``[start, end]``.
 
-        Backend-side InfluxDB 1.x query (stdlib HTTP, bounded timeout, off
-        the event loop). The browser never contacts the database. Returns
+        Backend-side InfluxDB 1.x query (async HTTP, total deadline, bounded
+        concurrency). The browser never contacts the database. Returns
         ``{start, end, step_s, points: [{t, in_mbps, out_mbps}]}`` — null
         Mbps values mark missing buckets (never zeros). No credentials are
         created, stored, or sent; only the no-auth source configured in
@@ -443,10 +452,15 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
                 status_code=400,
                 detail="throughput overlay not configured (set the InfluxDB URL in settings)",
             )
+        if throughput_semaphore.locked():
+            raise HTTPException(429, "throughput busy", headers={"Retry-After": "2"})
+        await throughput_semaphore.acquire()
         try:
-            result = await asyncio.to_thread(influx_mod.query_throughput, cfg, start_s, end_s)
+            result = await influx_mod.query_throughput(cfg, start_s, end_s)
         except influx_mod.InfluxError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        finally:
+            throughput_semaphore.release()
         return {"start": start_s, "end": end_s, **result}
 
     # --------------------------------------------------------------- traces
@@ -853,8 +867,18 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         session = manager.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="unknown session")
-        return StreamingResponse(
-            _sse_stream(session),
+        if sse_semaphore.locked():
+            raise HTTPException(429, "event-stream limit reached", headers={"Retry-After": "2"})
+        await sse_semaphore.acquire()
+        slot = _ExportSlot(sse_semaphore)
+        try:
+            queue = session.subscribe()
+        except SubscriberLimitReached as exc:
+            slot.release()
+            raise HTTPException(429, str(exc), headers={"Retry-After": "2"}) from exc
+        return _SSEStreamingResponse(
+            _sse_stream(session, queue),
+            session=session, queue=queue, export_slot=slot,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -866,7 +890,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     return app
 
 
-async def _sse_stream(session) -> AsyncIterator[str]:
+async def _sse_stream(session, queue=None) -> AsyncIterator[str]:
     """Yield a Server-Sent Events stream for one session.
 
     Wire format:
@@ -891,7 +915,8 @@ async def _sse_stream(session) -> AsyncIterator[str]:
     """
     from .session import RoundEvent, RouteEvent
 
-    queue = session.subscribe()
+    if queue is None:
+        queue = session.subscribe()
     try:
         yield "retry: 1000\n\n"
         yield "event: ready\ndata: {}\n\n"
@@ -976,6 +1001,21 @@ class _ExportStreamingResponse(StreamingResponse):
             finally:
                 if self._export_slot is not None:
                     self._export_slot.release()
+
+
+class _SSEStreamingResponse(_ExportStreamingResponse):
+    """Release admission even if sending headers fails before iteration."""
+
+    def __init__(self, *args, session, queue, **kwargs):
+        self._session = session
+        self._queue = queue
+        super().__init__(*args, **kwargs)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._session.unsubscribe(self._queue)
 
 
 def _format_route_event(hops) -> str:

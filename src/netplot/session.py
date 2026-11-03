@@ -90,6 +90,7 @@ HOP_SNAPSHOT_TAIL = 100
 # grow process memory without limit.  Live SSE is best-effort, so events are
 # dropped when this queue is full.
 SUBSCRIBER_QUEUE_CAP = 256
+MAX_SUBSCRIBERS_PER_SESSION = 8
 
 # Default probe reply timeout. PingPlotter uses 3 s; the spec adopts this.
 PROBE_TIMEOUT_S = 3.0
@@ -165,6 +166,10 @@ ROLLUP_CAP = _env_int("NETPLOT_ROLLUP_CAP", 1440)
 # closed natively, so without an explicit marker a stream would wait forever
 # after its session's probe task had been removed.
 _SESSION_CLOSED = object()
+
+
+class SubscriberLimitReached(Exception):
+    """A session already has the maximum number of live streams."""
 
 
 class SessionLimitReached(Exception):
@@ -861,6 +866,8 @@ class TraceSession:
 
     def subscribe(self) -> asyncio.Queue:
         """Register a subscriber queue; the SSE stream uses this."""
+        if len(self._subscribers) >= MAX_SUBSCRIBERS_PER_SESSION:
+            raise SubscriberLimitReached("session event-stream limit reached")
         queue: asyncio.Queue = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_CAP)
         self._subscribers.add(queue)
         if self._closed:

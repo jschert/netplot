@@ -1089,7 +1089,7 @@ def _create_then(
 
 
 def test_create_with_persistent_writes_state_file(tmp_path: Path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         sid = _create_then(client, persistent=True, name="api-trace")
         # File written with the session definition.
         store = PersistentStore(tmp_path)
@@ -1102,13 +1102,13 @@ def test_create_with_persistent_writes_state_file(tmp_path: Path) -> None:
 
 
 def test_create_without_persistent_does_not_write_file(tmp_path: Path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         _create_then(client)
         assert not PersistentStore(tmp_path).path.exists()
 
 
 def test_create_response_carries_name_and_persistent(tmp_path: Path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         r = client.post(
             "/api/traces",
             json={
@@ -1129,7 +1129,7 @@ def test_create_validates_name_length(tmp_path: Path) -> None:
     The validator sanitizes (which includes truncation), so the create
     succeeds and the stored name is exactly MAX_NAME_LEN chars.
     """
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         long_name = "x" * (MAX_NAME_LEN + 50)
         r = client.post(
             "/api/traces",
@@ -1143,7 +1143,7 @@ def test_create_validates_name_length(tmp_path: Path) -> None:
 
 
 def test_create_strips_control_chars_from_name(tmp_path: Path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         r = client.post(
             "/api/traces",
             json={"target": "127.0.0.1", "interval_s": 2.0, "name": "a\tb\x07c"},
@@ -1158,7 +1158,7 @@ def test_create_strips_control_chars_from_name(tmp_path: Path) -> None:
 
 
 def test_persist_endpoint_toggles_persistent_flag(tmp_path: Path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         sid = _create_then(client)
         # File not written yet (non-persistent).
         assert not PersistentStore(tmp_path).path.exists()
@@ -1186,7 +1186,7 @@ def test_persist_endpoint_toggles_persistent_flag(tmp_path: Path) -> None:
 
 
 def test_persist_endpoint_renames(tmp_path: Path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         sid = _create_then(client, persistent=True, name="old")
         r = client.post(
             f"/api/traces/{sid}/persist",
@@ -1201,7 +1201,7 @@ def test_persist_endpoint_renames(tmp_path: Path) -> None:
 def test_persist_endpoint_returns_404_for_unknown_session(
     tmp_path: Path,
 ) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         r = client.post(
             "/api/traces/deadbeef/persist",
             json={"persistent": True},
@@ -1210,7 +1210,7 @@ def test_persist_endpoint_returns_404_for_unknown_session(
 
 
 def test_persist_endpoint_validates_name(tmp_path: Path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         sid = _create_then(client, persistent=True)
         r = client.post(
             f"/api/traces/{sid}/persist",
@@ -1224,7 +1224,7 @@ def test_persist_endpoint_validates_name(tmp_path: Path) -> None:
 
 def test_persist_endpoint_422_when_persistent_missing(tmp_path: Path) -> None:
     """``persistent`` is required on the persist endpoint."""
-    client = TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False)
+    client = TestClient(create_app(data_dir=tmp_path), base_url="http://localhost", raise_server_exceptions=False)
     sid = _create_then(client)
     r = client.post(f"/api/traces/{sid}/persist", json={"name": "x"})
     assert r.status_code == 422
@@ -1249,7 +1249,7 @@ def test_create_app_restores_on_startup(tmp_path: Path) -> None:
             }
         ]
     )
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         listing = client.get("/api/traces").json()
         assert len(listing) == 1
         assert listing[0]["id"] == "boot-restore"
@@ -1274,7 +1274,7 @@ def test_create_app_restore_paused_session(tmp_path: Path) -> None:
             }
         ]
     )
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         listing = client.get("/api/traces").json()
         assert len(listing) == 1
         assert listing[0]["state"] == "paused"
@@ -1284,7 +1284,7 @@ def test_create_app_restore_paused_session(tmp_path: Path) -> None:
 def test_create_app_restore_corrupt_file_does_not_crash(tmp_path: Path) -> None:
     """A corrupt state file at boot is ignored; the app still serves."""
     PersistentStore(tmp_path).path.write_text("{garbage", encoding="utf-8")
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         # App came up; listing is empty (no restore, no crash).
         assert client.get("/api/traces").json() == []
         # And a fresh create still works.
@@ -1308,7 +1308,7 @@ def test_create_app_restore_caps_at_max_sessions(tmp_path: Path) -> None:
             for i in range(MAX_SESSIONS + 2)
         ]
     )
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         listing = client.get("/api/traces").json()
         assert len(listing) == MAX_SESSIONS
 
@@ -1335,7 +1335,7 @@ def test_snapshot_carries_persistence_fields() -> None:
 
 
 def test_list_endpoint_includes_persistence_fields(tmp_path: Path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         _create_then(client, persistent=True, name="listed")
         items = client.get("/api/traces").json()
         assert len(items) == 1
@@ -1344,7 +1344,7 @@ def test_list_endpoint_includes_persistence_fields(tmp_path: Path) -> None:
 
 
 def test_snapshot_endpoint_includes_persistence_fields(tmp_path: Path) -> None:
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         sid = _create_then(client, persistent=True, name="snapped")
         snap = client.get(f"/api/traces/{sid}/snapshot").json()
         assert snap["persistent"] is True
@@ -1364,7 +1364,7 @@ def test_persist_toggle_while_running_does_not_disturb_probing(
     hardening from 2b40c4b (effNowS freeze, paused_at, generation-gated
     snapshots) — the persist path is orthogonal to the probe loop.
     """
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         sid = _create_then(client, interval_s=1.0)
         # Grab the probe task via the manager.
         mgr = client.app.state.session_manager
@@ -1403,7 +1403,7 @@ def test_restored_session_flows_through_snapshot_path(tmp_path: Path) -> None:
             }
         ]
     )
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         snap = client.get("/api/traces/snapshot-check/snapshot").json()
         assert snap["id"] == "snapshot-check"
         assert snap["persistent"] is True
@@ -1434,7 +1434,7 @@ def test_degraded_store_quarantines_and_enters_readonly(tmp_path: Path) -> None:
 def test_degraded_store_surfaces_on_healthz(tmp_path: Path) -> None:
     """``/healthz`` carries ``persistence: "degraded"`` after a degraded boot."""
     PersistentStore(tmp_path).path.write_text("{garbage", encoding="utf-8")
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         h = client.get("/healthz").json()
         assert h["status"] == "ok"
         assert h["persistence"] == "degraded"
@@ -1442,7 +1442,7 @@ def test_degraded_store_surfaces_on_healthz(tmp_path: Path) -> None:
 
 def test_healthz_omits_persistence_when_healthy(tmp_path: Path) -> None:
     """No degraded state → healthz carries only ``status: ok``."""
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         h = client.get("/healthz").json()
         assert h["status"] == "ok"
         assert "persistence" not in h
@@ -1548,7 +1548,7 @@ def test_degraded_restore_caps_by_successful_count_not_offset(
 def test_degraded_persist_returns_503(tmp_path: Path) -> None:
     """A persist POST against a degraded store returns 503, not 500."""
     PersistentStore(tmp_path).path.write_text("{garbage", encoding="utf-8")
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         # Create a non-persistent session first (does not touch disk).
         sid = _create_then(client)
         r = client.post(f"/api/traces/{sid}/persist", json={"persistent": True})
@@ -1558,7 +1558,7 @@ def test_degraded_persist_returns_503(tmp_path: Path) -> None:
 def test_degraded_create_persistent_returns_503(tmp_path: Path) -> None:
     """Creating a persistent session against a degraded store returns 503."""
     PersistentStore(tmp_path).path.write_text("{garbage", encoding="utf-8")
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         r = client.post(
             "/api/traces",
             json={"target": "127.0.0.1", "interval_s": 2.0, "persistent": True},
@@ -1683,7 +1683,7 @@ def test_non_cancelled_persistent_create_works_normally(tmp_path: Path) -> None:
 def test_persist_noop_fast_path_no_lock_no_write(tmp_path: Path) -> None:
     """An idempotent persist POST (same flag, no name change) does not take
     the lock or touch disk."""
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         sid = _create_then(client, persistent=True, name="lbl")
         store = PersistentStore(tmp_path)
         mtime_before = store.path.stat().st_mtime_ns
@@ -1702,7 +1702,7 @@ def test_persist_noop_fast_path_no_lock_no_write(tmp_path: Path) -> None:
 
 def test_persist_noop_same_name_no_write(tmp_path: Path) -> None:
     """Same flag + same name → no-op (no write)."""
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         sid = _create_then(client, persistent=True, name="keep")
         store = PersistentStore(tmp_path)
         mtime_before = store.path.stat().st_mtime_ns
@@ -1719,7 +1719,7 @@ def test_persist_noop_same_name_no_write(tmp_path: Path) -> None:
 def test_persist_returns_409_when_mutation_pending(tmp_path: Path) -> None:
     """A persist POST while a pause is in progress returns 409, not a
     blocked worker."""
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         sid = _create_then(client, persistent=True)
         mgr = client.app.state.session_manager
         session = mgr.get(sid)
@@ -1744,7 +1744,7 @@ def test_persist_returns_409_when_mutation_pending(tmp_path: Path) -> None:
 def test_persist_after_delete_returns_404(tmp_path: Path) -> None:
     """A persist POST that resolves a session, then loses to a concurrent
     delete, returns 404 (not 200 with stale persistent:true)."""
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(create_app(data_dir=tmp_path), base_url="http://localhost") as client:
         sid = _create_then(client, persistent=True)
         mgr = client.app.state.session_manager
         session = mgr.get(sid)
