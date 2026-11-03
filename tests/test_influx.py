@@ -286,6 +286,28 @@ def test_fetch_query_caps_response_bytes():
         )
 
 
+def test_fetch_query_invalid_idna_host_is_influx_error_not_httpx_leak():
+    """A URL the settings grammar accepts but httpx cannot build a request
+    for (IDNA-unencodable host, e.g. the reserved ☃.example) must surface as
+    the usual controlled InfluxError — never an httpx.InvalidURL escaping to
+    the caller (which would surface as HTTP 500 at the endpoint). The mock
+    transport makes the no-external-network guarantee explicit: if the
+    request were ever built, it would be answered in-process."""
+
+    def handler(request):
+        raise AssertionError("invalid URL must fail before any transport use")
+
+    with pytest.raises(InfluxError, match="invalid"):
+        asyncio.run(
+            influx.fetch_query(
+                "http://☃.example",
+                "telegraf",
+                "SELECT 1",
+                transport=httpx.MockTransport(handler),
+            )
+        )
+
+
 # ------------------------------------- fetch_query over real HTTPS (TLS)
 
 
@@ -507,6 +529,33 @@ def test_throughput_502_on_influx_error(tmp_path, monkeypatch) -> None:
         r = client.get("/api/throughput?start=0&end=60")
         assert r.status_code == 502
         assert "unreachable" in r.json()["detail"]
+
+
+def test_throughput_invalid_destination_url_is_502_not_500(tmp_path) -> None:
+    """End-to-end mapping for the accepted-but-unusable destination: the
+    settings PUT accepts the reserved malformed host today (the URL grammar
+    is deliberately NOT tightened in this bounded version), and the throughput query
+    must turn httpx.InvalidURL into the normal 502 error path instead of an
+    unhandled 500. No network is involved — the URL fails at request-build
+    time inside the client."""
+    client = TestClient(
+        create_app(data_dir=tmp_path),
+        base_url="http://localhost",
+        raise_server_exceptions=False,
+    )
+    with client:
+        put = client.put(
+            "/api/settings/influx",
+            json={
+                "url": "http://☃.example",
+                "database": "telegraf",
+                "interface": "wan",
+            },
+        )
+        assert put.status_code == 200  # grammar intentionally unchanged
+        r = client.get("/api/throughput?start=0&end=60")
+        assert r.status_code == 502
+        assert "invalid" in r.json()["detail"].lower()
 
 
 @pytest.mark.parametrize(

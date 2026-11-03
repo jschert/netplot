@@ -255,12 +255,30 @@ def load_settings(data_dir: Path | str) -> dict:
     Missing file → defaults. Present-but-unusable (unreadable, oversized,
     corrupt JSON, unknown version, invalid values) → defaults with a
     logged warning. The next successful PUT overwrites the bad file.
+
+    The size limit is enforced *before* any read (stat gate), so an
+    oversized operator-local file (or one swapped in for a special file)
+    is never slurped into memory; the read itself is capped at one byte
+    past the limit and re-checked, so a file that grows between the
+    stat and the read is still rejected without an unbounded read.
     """
     path = Path(data_dir) / SETTINGS_FILENAME
     try:
-        raw = path.read_bytes()
+        size = path.stat().st_size
     except FileNotFoundError:
         return default_settings()
+    except OSError as exc:
+        log.warning("netplot: settings file unreadable (%s): %s; using defaults", path, exc)
+        return default_settings()
+    if size > MAX_SETTINGS_FILE_BYTES:
+        log.warning("netplot: settings file oversized (%d bytes); using defaults", size)
+        return default_settings()
+    try:
+        with path.open("rb") as fh:
+            # Capped at limit + 1 byte: just enough to re-check the limit
+            # below, never enough for an unbounded read of a file that
+            # grew (or was swapped) since the stat above.
+            raw = fh.read(MAX_SETTINGS_FILE_BYTES + 1)
     except OSError as exc:
         log.warning("netplot: settings file unreadable (%s): %s; using defaults", path, exc)
         return default_settings()
@@ -275,7 +293,21 @@ def load_settings(data_dir: Path | str) -> dict:
             raise ValueError(f"unknown schema version {payload.get('version')!r}")
         cidrs = normalize_cidrs(payload.get("internal_cidrs", []))
         influx = normalize_influx(payload.get("influx", {}))
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+    except (
+        # RecursionError: deeply nested JSON (tens of thousands of
+        # brackets fit in the 64 KiB cap) can exhaust the C parser's
+        # recursion budget, whose exact depth varies by interpreter
+        # build and version — so it is caught explicitly rather than
+        # assumed to arrive as a ValueError. Either way the contract
+        # is the same: an unusable file means defaults, never an
+        # exception out of ``load_settings`` (it runs inside
+        # ``create_app`` at boot, where an escape would crash the
+        # process).
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        RecursionError,
+    ) as exc:
         log.warning("netplot: settings file unusable (%s): %s; using defaults", path, exc)
         return default_settings()
     return {

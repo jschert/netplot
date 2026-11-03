@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from netplot.session import Hop, SessionManager
 from netplot.settings import (
     DEFAULT_INTERNAL_CIDRS,
+    MAX_SETTINGS_FILE_BYTES,
     SETTINGS_FILENAME,
     default_settings,
     load_settings,
@@ -64,6 +65,92 @@ def test_load_settings_invalid_values_fall_back_to_defaults(tmp_path) -> None:
         json.dumps({"version": 1, "internal_cidrs": ["300.0.0.0/8"], "influx": {}}),
         encoding="utf-8",
     )
+    assert load_settings(tmp_path) == default_settings()
+
+
+def test_load_settings_oversized_file_falls_back_to_defaults(tmp_path) -> None:
+    path = tmp_path / SETTINGS_FILENAME
+    path.write_bytes(b'{"version": 1}' + b" " * (MAX_SETTINGS_FILE_BYTES + 1))
+    assert path.stat().st_size > MAX_SETTINGS_FILE_BYTES
+    assert load_settings(tmp_path) == default_settings()
+
+
+def test_load_settings_file_exactly_at_limit_still_loads(tmp_path) -> None:
+    """Boundary preserved: a valid file of exactly the limit (JSON
+    tolerates the trailing-space padding) loads normally."""
+    doc = json.dumps({"version": 1, "internal_cidrs": ["10.0.0.0/8"], "influx": {}})
+    payload = doc.encode("utf-8").ljust(MAX_SETTINGS_FILE_BYTES, b" ")
+    path = tmp_path / SETTINGS_FILENAME
+    path.write_bytes(payload)
+    assert path.stat().st_size == MAX_SETTINGS_FILE_BYTES
+    loaded = load_settings(tmp_path)
+    assert loaded["internal_cidrs"] == ["10.0.0.0/8"]
+    assert loaded["influx"] == default_settings()["influx"]
+
+
+def test_load_settings_caps_read_when_file_grows_after_stat(tmp_path, monkeypatch) -> None:
+    """TOCTOU: if the file grows between the stat gate and the read (the
+    stat is patched to under-report), at most limit + 1 bytes are ever
+    pulled in and the file is still rejected with defaults."""
+    import os
+    import pathlib
+
+    (tmp_path / SETTINGS_FILENAME).write_bytes(
+        b'{"version": 1}' + b" " * (MAX_SETTINGS_FILE_BYTES + 4096)
+    )
+
+    real_open = pathlib.Path.open
+    read_sizes = {"max": 0}
+
+    class _SpyFile:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def read(self, size=-1):
+            data = self._fh.read(size)
+            read_sizes["max"] = max(read_sizes["max"], len(data))
+            return data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self._fh.__exit__(*exc)
+
+    def spying_open(self, *args, **kwargs):
+        fh = real_open(self, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        return _SpyFile(fh) if "b" in mode else fh
+
+    def shrunken_stat(self, **kwargs):
+        # Only st_size is consulted; pretend the gate saw a tiny file.
+        return os.stat_result((0, 0, 0, 0, 0, 0, 10, 0, 0, 0))
+
+    monkeypatch.setattr(pathlib.Path, "open", spying_open)
+    monkeypatch.setattr(pathlib.Path, "stat", shrunken_stat)
+    assert load_settings(tmp_path) == default_settings()
+    # The read path was exercised, but the pull was capped.
+    assert 0 < read_sizes["max"] <= MAX_SETTINGS_FILE_BYTES + 1
+
+
+def test_load_settings_deeply_nested_file_falls_back_to_defaults(tmp_path) -> None:
+    """A pathologically nested (yet size-legal) file must not crash boot.
+
+    Tens of thousands of nested brackets fit inside the 64 KiB size
+    cap. A depth beyond the C JSON parser's recursion budget — which
+    varies by interpreter build and version — makes ``json.loads``
+    raise ``RecursionError``, which is NOT a ``ValueError``;
+    ``load_settings`` runs inside ``create_app`` at boot, where an
+    escape would crash the process. The contract "never raises" must
+    hold for every unusable file, whatever exception class the parser
+    picks: on a build with more headroom the same file parses and is
+    rejected as "root is not an object" instead — the assertion covers
+    both outcomes.
+    """
+    (tmp_path / SETTINGS_FILENAME).write_text(
+        "[" * 16000 + "]" * 16000, encoding="utf-8"
+    )
+    assert (tmp_path / SETTINGS_FILENAME).stat().st_size < MAX_SETTINGS_FILE_BYTES
     assert load_settings(tmp_path) == default_settings()
 
 

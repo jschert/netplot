@@ -72,6 +72,30 @@ def _manager(store: PersistentStore) -> SessionManager:
     )
 
 
+def _require_hardlink_support(tmp_path: Path) -> None:
+    """Skip unless the filesystem honors ``os.link``.
+
+    The bounded-read regression tests below assume the quarantine's
+    primary path (hard link, zero reads of the source). On a filesystem
+    without link support the quarantine deliberately falls back to an
+    exclusive STREAMING copy — bounded per chunk, but it does read the
+    whole source — so those tests' aggregate bounds would not hold there.
+    """
+    src = tmp_path / "_linkprobe_src"
+    dst = tmp_path / "_linkprobe_dst"
+    src.write_bytes(b"x")
+    try:
+        os.link(src, dst)
+    except OSError:
+        pytest.skip(
+            "filesystem does not support hard links; the quarantine "
+            "streaming-copy fallback applies instead"
+        )
+    finally:
+        src.unlink(missing_ok=True)
+        dst.unlink(missing_ok=True)
+
+
 # ============================================================== PersistentStore
 #
 # Pure I/O tests: the store knows nothing about TraceSession and reads /
@@ -239,6 +263,43 @@ def test_read_corrupt_json_degrades_and_quarantines(tmp_path: Path, caplog) -> N
     assert any("corrupt" in rec.message for rec in caplog.records)
 
 
+def test_read_deeply_nested_json_degrades_and_quarantines(
+    tmp_path: Path, caplog
+) -> None:
+    """Size-legal but deeply-nested JSON degrades like any corrupt file.
+
+    The byte cap bounds file size, not nesting depth: tens of thousands
+    of nested brackets fit far under the cap, and a depth beyond the C
+    parser's recursion budget makes json.loads raise RecursionError —
+    which is not a ValueError — instead of a decode error. That budget
+    varies by interpreter build and version, so the fixture uses a
+    depth deep enough to exhaust it on the pinned CPython 3.12; on a
+    build with more headroom the same file parses and is rejected as a
+    non-object root instead. Either way the read must end degraded,
+    quarantined, and read-only — never let the exception escape boot.
+    """
+    deep = b"[" * 16_000 + b"]" * 16_000
+    assert len(deep) <= MAX_STATE_FILE_BYTES  # size-legal by construction
+    store = PersistentStore(tmp_path)
+    store.path.write_bytes(deep)
+
+    with caplog.at_level("WARNING"):
+        result = store.read()
+
+    assert result.status == "degraded"
+    assert result.entries == []
+    assert "corrupt" in (result.reason or "")
+    # The original (deep) bytes are preserved for operator recovery.
+    assert result.quarantine_path is not None
+    assert result.quarantine_path.read_bytes() == deep
+    assert not store.path.exists()
+    # Store is now read-only: writes are refused.
+    assert store.is_degraded()
+    with pytest.raises(PersistDegraded):
+        store.write([])
+    assert any("corrupt" in rec.message for rec in caplog.records)
+
+
 def test_read_unknown_schema_version_degrades(tmp_path: Path, caplog) -> None:
     store = PersistentStore(tmp_path)
     store.path.write_text(json.dumps({"version": 99, "sessions": []}), encoding="utf-8")
@@ -318,6 +379,170 @@ def test_read_oversized_file_degrades(tmp_path: Path, caplog) -> None:
     assert result.quarantine_path.stat().st_size == MAX_STATE_FILE_BYTES + 1
     assert store.is_degraded()
     assert any("oversized" in rec.message for rec in caplog.records)
+
+
+def test_read_oversized_file_rejects_without_buffering_it(tmp_path: Path) -> None:
+    """Handling an oversized state file must never hold it in memory.
+
+    Regression: read() used to slurp the WHOLE file into a buffer before
+    checking the cap, so a hostile or accidentally huge ``sessions.json``
+    allocated its full size at boot — defeating MAX_STATE_FILE_BYTES'
+    documented purpose ("bound boot-time memory ... when the file is
+    corrupt or supplied by an untrusted mount").
+
+    The bound is asserted on MEASURED ALLOCATIONS (tracemalloc peak during
+    read()), not on which file-reading method is used: any spelling that
+    buffers the rejected file — read_bytes, read_text, open().read(), or
+    chunked-into-one-buffer — allocates at least the file size and trips
+    the threshold, whatever its name. The stat-gated reject path (plus the
+    byte-preserving quarantine move, which links rather than copies)
+    allocates only a few KiB, orders of magnitude below it.
+    """
+    import tracemalloc
+
+    store = PersistentStore(tmp_path)
+    # 4x the cap: unambiguously above both the incidental allocations of
+    # the reject path and the cap itself, so even a single cap-sized
+    # partial buffer of the rejected file is caught.
+    payload = b"x" * (MAX_STATE_FILE_BYTES * 4)
+    store.path.write_bytes(payload)
+
+    # The allocation bound assumes the quarantine moved the bytes without
+    # reading them (hard link). On link-less filesystems the quarantine
+    # legitimately STREAMS the file in bounded chunks instead — exercise
+    # that path in its own environment, not here.
+    _require_hardlink_support(tmp_path)
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        result = store.read()
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result.status == "degraded"
+    assert "oversized" in (result.reason or "")
+    assert result.quarantine_path is not None
+    # The original (oversized) bytes were preserved by the move, not parsed.
+    assert result.quarantine_path.stat().st_size == len(payload)
+    assert not os.path.exists(store.path)
+    assert store.is_degraded()
+    # The allocation bound itself: nothing proportional to the file size
+    # was ever held, in any reading spelling. Half the cap sits orders of
+    # magnitude above the reject path's few-KiB incidental allocations and
+    # far below the 1 MiB cap (let alone this 4 MiB file).
+    assert peak <= MAX_STATE_FILE_BYTES // 2, (
+        f"oversized-file handling buffered ~{peak} bytes "
+        f"(file is {len(payload)} bytes, cap {MAX_STATE_FILE_BYTES})"
+    )
+
+
+def test_read_file_grown_past_cap_after_stat_stays_bounded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """stat->read race: a file small at stat() but oversized by read() time
+    is still rejected, and the bytes pulled out of the file never exceed the
+    cap+1 budget — however many reads, whatever chunking, whichever opening
+    spelling is used.
+
+    Instrumentation counts the bytes DELIVERED by every read on the state
+    file's object (Path.open / Path.read_bytes / read_text and builtin
+    ``open`` all resolve to the counting wrapper) instead of asserting a
+    particular read-call shape, so a correctly-bounded reimplementation
+    (multiple smaller reads included) passes while any spelling that pulls
+    more than cap+1 bytes in aggregate fails. The degrade/quarantine
+    outcome is asserted on real disk state.
+    """
+    import builtins
+    import pathlib
+    from types import SimpleNamespace
+
+    store = PersistentStore(tmp_path)
+    payload = b"x" * (MAX_STATE_FILE_BYTES + 512)
+    store.path.write_bytes(payload)
+    # The aggregate-delivered bound assumes the quarantine moved the bytes
+    # via hard link (no read of the source). On link-less filesystems the
+    # quarantine legitimately streams the whole file in bounded chunks, so
+    # the aggregate would not apply — skip there.
+    _require_hardlink_support(tmp_path)
+
+    real_stat = pathlib.Path.stat
+
+    def lying_stat(self, **kwargs):
+        if self == store.path:
+            return SimpleNamespace(st_size=16)
+        return real_stat(self, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "stat", lying_stat)
+
+    bytes_delivered: list[int] = [0]
+
+    class _CountingFile:
+        """Delegating file wrapper counting bytes returned by any read."""
+
+        def __init__(self, fh) -> None:
+            self._fh = fh
+
+        def _count(self, data) -> object:
+            if isinstance(data, bytes):
+                bytes_delivered[0] += len(data)
+            elif isinstance(data, str):
+                bytes_delivered[0] += len(data.encode("utf-8", "surrogateescape"))
+            return data
+
+        def read(self, *args):
+            return self._count(self._fh.read(*args))
+
+        def read1(self, *args):
+            return self._count(self._fh.read1(*args))
+
+        def __getattr__(self, name):
+            return getattr(self._fh, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> None:
+            self._fh.close()
+
+    real_path_open = pathlib.Path.open
+
+    def counting_path_open(self, *args, **kwargs):
+        if self == store.path:
+            return _CountingFile(real_path_open(self, *args, **kwargs))
+        return real_path_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "open", counting_path_open)
+
+    real_builtin_open = builtins.open
+
+    def counting_builtin_open(file, *args, **kwargs):
+        try:
+            if Path(file) == store.path:
+                return _CountingFile(real_builtin_open(file, *args, **kwargs))
+        except TypeError:
+            pass
+        return real_builtin_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_builtin_open)
+
+    result = store.read()
+
+    assert result.status == "degraded"
+    assert "oversized" in (result.reason or "")
+    assert store.is_degraded()
+    # The race window was actually exercised through the read path...
+    assert bytes_delivered[0] > 0
+    # ...and the meaningful bound held: no spelling pulled more than the
+    # cap+1 budget out of the file that stat() claimed was tiny.
+    assert bytes_delivered[0] <= MAX_STATE_FILE_BYTES + 1
+    # The (real, oversized) bytes were preserved by the quarantine move.
+    # os.path.exists bypasses the patched Path.stat, which would otherwise
+    # happily report the lying size for a file that no longer exists.
+    assert result.quarantine_path is not None
+    assert result.quarantine_path.stat().st_size == len(payload)
+    assert not os.path.exists(store.path)
 
 
 def test_read_drops_invalid_entries_degrades_but_restores_valid(
@@ -697,7 +922,7 @@ def test_write_payload_includes_schema_version(tmp_path: Path) -> None:
         ("emoji ✅ ok", "emoji ✅ ok"),  # non-control unicode preserved
         ("a" * 200, "a" * MAX_NAME_LEN),  # hard truncation
         ("\U0001f600lead", "\U0001f600lead"),  # supplementary plane kept
-        # Cf (format) characters — the prior range-based regex missed these.
+        # Cf (format) characters: invisible joiners, bidi overrides, BOM.
         ("a\u202eb", "a b"),  # U+202E RIGHT-TO-LEFT OVERRIDE (bidi spoofing)
         ("a\u200bb", "a b"),  # U+200B ZERO WIDTH SPACE
         ("a\ufeffb", "a b"),  # U+FEFF BOM / ZERO WIDTH NO-BREAK SPACE
@@ -724,16 +949,16 @@ def test_sanitize_name(raw, expected: str) -> None:
 def test_sanitize_name_surrogate_does_not_crash_utf8_encode() -> None:
     """An unpaired surrogate in a name must not crash the UTF-8 write path.
 
-    The prior range-based regex did not strip Cs code points; a stored
-    name containing a lone surrogate would pass sanitize_name, then crash
-    ``json.dumps(..., ensure_ascii=False)`` → ``str.encode('utf-8')`` with
-    ``UnicodeEncodeError``, producing a repeatable persistence failure.
-    The category-based filter strips Cs before the write ever sees them.
+    A stored name containing a lone surrogate must never reach the write
+    path: it would crash ``json.dumps(..., ensure_ascii=False)`` →
+    ``str.encode('utf-8')`` with ``UnicodeEncodeError``, producing a
+    repeatable persistence failure. The category-based filter strips Cs
+    before the write ever sees them.
     """
     cleaned = sanitize_name("bad\ud800name")
     # No surrogate survives.
     assert "\ud800" not in cleaned
-    # Encoding must succeed (this would raise before the fix).
+    # Encoding must succeed (a lone surrogate would raise here).
     cleaned.encode("utf-8")
 
 
@@ -1411,7 +1636,7 @@ def test_restored_session_flows_through_snapshot_path(tmp_path: Path) -> None:
         assert snap["state"] == "running"
 
 
-# ============================================================== Finding 1: degraded mode
+# ============================================================== degraded mode
 
 
 def test_degraded_store_quarantines_and_enters_readonly(tmp_path: Path) -> None:
@@ -1566,7 +1791,7 @@ def test_degraded_create_persistent_returns_503(tmp_path: Path) -> None:
         assert r.status_code == 503
 
 
-# ============================================================== Finding 3: cancelled persistent create
+# ============================================================== cancelled persistent create
 
 
 def test_cancelled_persistent_create_does_not_leave_durable_running(
@@ -1677,7 +1902,7 @@ def test_non_cancelled_persistent_create_works_normally(tmp_path: Path) -> None:
     asyncio.run(mgr.shutdown())
 
 
-# ============================================================== Finding 4: persist no-op + 409
+# ============================================================== persist no-op + 409
 
 
 def test_persist_noop_fast_path_no_lock_no_write(tmp_path: Path) -> None:
@@ -1738,7 +1963,7 @@ def test_persist_returns_409_when_mutation_pending(tmp_path: Path) -> None:
             session._mutation_lock.release()
 
 
-# ============================================================== Finding 5: stale-object 404
+# ============================================================== stale-object 404
 
 
 def test_persist_after_delete_returns_404(tmp_path: Path) -> None:
@@ -1824,7 +2049,7 @@ def test_delete_after_delete_raises_not_registered(tmp_path: Path) -> None:
         mgr._require_registered(s)
 
 
-# ============================================================== Finding 6: parent dir fsync
+# ============================================================== parent dir fsync
 
 
 def test_fsync_new_parents_walks_chain(tmp_path: Path) -> None:
@@ -1929,11 +2154,11 @@ def test_first_write_fsyncs_parents(tmp_path: Path) -> None:
     assert store.path.exists()
 
 
-# ============================================================== Finding 7: category sanitizer — Unicode coverage
+# ============================================================== category sanitizer — Unicode coverage
 
 
 def test_sanitize_name_strips_all_cf_format_chars() -> None:
-    """Every Cf (format) code point is stripped — the prior regex missed these."""
+    """Every Cf (format) code point is stripped by the category filter."""
     # A representative sample across the Cf category.
     cf_chars = [
         "\u00ad",  # SOFT HYPHEN

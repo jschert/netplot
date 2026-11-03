@@ -284,6 +284,13 @@ async def fetch_query(
                         if len(body) + len(chunk) > MAX_RESPONSE_BYTES:
                             raise InfluxError("influx response too large")
                         body.extend(chunk)
+    except httpx.InvalidURL as exc:
+        # A destination URL that survives the settings grammar but that the
+        # HTTP client rejects at request-build time (e.g. an IDNA-
+        # unencodable host such as "☃.example"): operator misconfiguration,
+        # surfaced as the usual controlled InfluxError (→ HTTP 502) rather
+        # than an uncaught exception (→ HTTP 500).
+        raise InfluxError("influx destination URL is invalid") from exc
     except (httpx.HTTPError, TimeoutError, OSError) as exc:
         raise InfluxError("influx unreachable or request deadline exceeded") from exc
     try:

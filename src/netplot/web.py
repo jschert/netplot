@@ -69,6 +69,11 @@ _INDEX_HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
 # The bound is small (2) because export is a rare, operator-triggered
 # operation, not a hot path — requests that cannot acquire a slot immediately
 # get HTTP 429 with a short Retry-After so the dashboard can retry cleanly.
+# The slot covers the response's whole lifetime: snapshot capture, off-loop
+# serialization, AND every ASGI body send up to and including the terminal
+# zero-length chunk, so a slow or stalled download cannot park a finished
+# body while further exports are admitted (see _ExportStreamingResponse;
+# EXPORT_TRANSFER_DEADLINE_S below bounds how long one transfer may hold it).
 EXPORT_CONCURRENCY_LIMIT = 2
 THROUGHPUT_CONCURRENCY_LIMIT = 4
 SSE_CONCURRENCY_LIMIT = 32
@@ -77,6 +82,24 @@ SSE_CONCURRENCY_LIMIT = 32
 # fixed: exports finish in well under a second each, so a 2 s backoff covers
 # a full slot-turnover with margin.
 EXPORT_RETRY_AFTER_S = "2"
+
+# Total wall-clock budget for one CSV export response, covering every ASGI
+# send from the status line/headers through the terminal zero-length body
+# chunk. Generous: a ~30 MiB max-size export still completes on a ~2 Mbit/s
+# link. The point is the ceiling, not the tuning — a client (or fronting
+# peer) that stops reading cannot pin an export slot and its retained
+# response body indefinitely: at the deadline the transfer is aborted
+# mid-body (never reported as a complete CSV) and the slot is returned.
+# SSE responses deliberately carry NO transfer deadline (they are
+# intentionally long-lived); they share only the same
+# release-on-every-exit cleanup.
+EXPORT_TRANSFER_DEADLINE_S = 120.0
+
+# The serialized CSV text is streamed in bounded chunks so one export does
+# not become a single multi-MiB transport write. Chunks are cut on
+# characters of the already-serialized text, so the concatenated body is
+# byte-exact with the CSV build.
+EXPORT_CHUNK_CHARS = 256 * 1024
 
 
 class CreateTraceRequest(BaseModel):
@@ -806,8 +829,15 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
            other requests during the CPU-bound serialization.
 
         A bounded semaphore (``EXPORT_CONCURRENCY_LIMIT``) wraps BOTH phases
-        so at most two exports are in flight at once; requests that cannot
-        acquire a slot immediately get HTTP 429 with a short Retry-After.
+        plus the response's entire transmission: the response object owns
+        the slot until every ASGI body send — including the terminal
+        zero-length chunk — has completed, so at most two exports are in
+        flight at once; requests that cannot acquire a slot immediately get
+        HTTP 429 with a short Retry-After. The whole send phase runs under
+        a generous total transfer deadline
+        (``EXPORT_TRANSFER_DEADLINE_S``): a stalled download is aborted
+        mid-body (never reported as a complete CSV) and its slot returned
+        rather than wedging export capacity.
         """
         session = manager.get(session_id)
         if session is None:
@@ -848,16 +878,17 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             # Phase 2 — off-loop CPU-bound serialization.
             csv_text = await asyncio.to_thread(_samples_csv_from_snapshot, snapshot)
             response = _ExportStreamingResponse(
-                _stream_export_body(csv_text, export_slot),
+                _stream_export_body(csv_text),
                 media_type="text/csv",
                 export_slot=export_slot,
+                transfer_deadline_s=EXPORT_TRANSFER_DEADLINE_S,
                 headers={
                     "Content-Disposition": f'attachment; filename="{filename}"',
                 },
             )
         except BaseException:
-            # If serialization or response construction fails, the streaming
-            # body never takes ownership of the slot.
+            # If serialization or response construction fails, the response
+            # object never takes ownership of the slot.
             export_slot.release()
             raise
         return response
@@ -950,18 +981,22 @@ async def _sse_stream(session, queue=None) -> AsyncIterator[str]:
         session.unsubscribe(queue)
 
 
-async def _stream_export_body(csv_text: str, slot: _ExportSlot) -> AsyncIterator[str]:
-    """Send one materialized export and release its slot after transmission.
+async def _stream_export_body(csv_text: str) -> AsyncIterator[str]:
+    """Stream one materialized export in bounded chunks.
 
-    Keeping the slot until the response body finishes (including client
-    disconnects) bounds retained response bodies as well as concurrent
-    serialization work.  The handler owns the slot until this generator is
-    returned; its ``finally`` takes ownership for the ASGI send phase.
+    The generator deliberately owns NOTHING. Export admission is owned by
+    the response object (:class:`_ExportStreamingResponse`), which holds
+    the slot through every ASGI send — including the terminal zero-length
+    body chunk — and returns it exactly once on completion, error,
+    disconnect, cancellation, or transfer deadline. (Releasing the slot in
+    this generator's ``finally`` instead would be wrong: capacity would
+    come back when the generator finishes — AFTER the last data-chunk
+    send but BEFORE the terminal ASGI send completes — so a peer applying
+    write backpressure could park finished bodies while further exports
+    are admitted.)
     """
-    try:
-        yield csv_text
-    finally:
-        slot.release()
+    for start in range(0, len(csv_text), EXPORT_CHUNK_CHARS):
+        yield csv_text[start : start + EXPORT_CHUNK_CHARS]
 
 
 class _ExportSlot:
@@ -978,21 +1013,41 @@ class _ExportSlot:
 
 
 class _ExportStreamingResponse(StreamingResponse):
-    """Close the export iterator even when ASGI send raises.
+    """Own export admission for the response's whole lifetime.
 
-    Starlette's normal async-for cleanup does not guarantee ``aclose()`` when
-    the downstream ``send`` callable raises.  The explicit close is therefore
-    needed for client disconnects and transport errors; the idempotent slot
-    makes this safe when the iterator's own ``finally`` already ran.
+    The response object — not the body iterator — is the single owner of
+    the export slot: admission stays held through every ASGI send (status
+    line/headers, each body chunk, and the terminal zero-length chunk) and
+    is returned exactly once afterwards on every exit path — normal
+    completion, send/transport error, client disconnect, task
+    cancellation, or the transfer deadline below. Starlette's normal
+    async-for cleanup does not guarantee ``aclose()`` when the downstream
+    ``send`` callable raises, so the explicit close remains load-bearing
+    for client disconnects and transport errors; the idempotent slot
+    makes overlapping release paths safe.
+
+    ``transfer_deadline_s`` (optional) bounds the whole send phase: a
+    stalled transfer is aborted mid-body — never reported as a complete
+    CSV — and its admission returned. SSE responses pass no deadline:
+    they are intentionally long-lived and must never be cut off by one.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         self._export_slot = kwargs.pop("export_slot", None)
+        self._transfer_deadline_s = kwargs.pop("transfer_deadline_s", None)
         super().__init__(*args, **kwargs)
 
     async def __call__(self, scope, receive, send) -> None:
         try:
-            await super().__call__(scope, receive, send)
+            if self._transfer_deadline_s is None:
+                await super().__call__(scope, receive, send)
+            else:
+                # The deadline covers the send phase only. Cleanup below
+                # runs after (and outside) the timeout context so a
+                # deadline expiry mid-send cannot interrupt the iterator
+                # close or the slot release.
+                async with asyncio.timeout(self._transfer_deadline_s):
+                    await super().__call__(scope, receive, send)
         finally:
             try:
                 close = getattr(self.body_iterator, "aclose", None)

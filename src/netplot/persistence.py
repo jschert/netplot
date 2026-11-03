@@ -47,6 +47,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import tempfile
 import unicodedata
 from collections.abc import Iterable
@@ -168,8 +169,8 @@ _NAME_WHITESPACE_RE = re.compile(r"\s+")
 # LTR/RTL marks, bidi overrides U+202E / U+2066–U+2069), ``Cs`` =
 # surrogate (unpaired surrogates that would also break UTF-8 encoding),
 # ``Co`` = private-use. A category-based filter is exhaustive where a
-# hand-maintained code-point range list (the prior approach) silently
-# missed Cf entries like U+202E / U+200B / U+FEFF and every Cs code point.
+# hand-maintained code-point range list can silently miss Cf entries
+# like U+202E / U+200B / U+FEFF and every Cs code point.
 _NAME_STRIP_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co"})
 
 
@@ -203,17 +204,17 @@ def sanitize_name(value: object) -> str:
     - Hard-truncated to :data:`MAX_NAME_LEN` AFTER normalization so the
       stored name can never exceed the cap.
 
-    A category-based filter is used instead of a hand-maintained code-point
-    range list because the list silently missed Cf entries (bidi overrides,
-    ZWSP, BOM) and every Cs code point. The Unicode database is the
-    authoritative source for "is this a control/format character".
+    A category-based filter is used because a hand-maintained code-point
+    range list can silently miss Cf entries (bidi overrides, ZWSP, BOM)
+    and every Cs code point. The Unicode database is the authoritative
+    source for "is this a control/format character".
     """
     if not isinstance(value, str):
         return ""
     # Replace each control/format/surrogate/private-use code point with a
     # space, then collapse whitespace runs and trim. Doing control→space
     # (not "") keeps visually adjacent tokens legible (e.g. "a\\tb" →
-    # "a b", not "ab") and matches the prior regex-substitute behaviour.
+    # "a b", not "ab").
     cleaned_chars: list[str] = []
     for ch in value:
         if unicodedata.category(ch) in _NAME_STRIP_CATEGORIES:
@@ -262,8 +263,11 @@ class PersistentStore:
         # Degraded/read-only flag. Set by :meth:`read` when the file is
         # present but unusable; cleared by a subsequent read that finds
         # the file absent (operator removed the quarantine + state) or
-        # fully valid. Mutated only under ``_state_lock`` so the API's
-        # ``/healthz`` read is consistent with the manager's writes.
+        # fully valid. In production ``read`` runs exactly once, at boot
+        # inside ``SessionManager.restore``, before request serving; the
+        # flag is only READ afterwards (``/healthz``, the write guards),
+        # so the plain-bool read/write (atomic under the GIL) is seen by
+        # the API as either the pre- or post-boot value, never torn.
         self._degraded: bool = False
         self._degraded_reason: str | None = None
         self._quarantine_path: Path | None = None
@@ -307,48 +311,86 @@ class PersistentStore:
         Boot never crashes: every I/O / parse / validation failure is
         caught and folded into a degraded result.
         """
-        try:
-            raw = self.path.read_bytes()
-        except FileNotFoundError:
-            self._clear_degraded()
-            return ReadResult(status="missing")
-        except OSError as exc:
-            # Unreadable for reasons other than absence (permissions, IO
-            # error): we cannot even get the bytes to quarantine. Treat
-            # as degraded with no quarantine; operator must investigate
-            # the path directly.
+        def _unreadable(exc: OSError) -> ReadResult:
+            # Unreadable/unstatable for reasons other than absence
+            # (permissions, IO error): we cannot even get the bytes to
+            # quarantine. Treat as degraded with no quarantine; operator
+            # must investigate the path directly.
             reason = f"unreadable state file: {exc}"
             log.warning("netplot: %s: %s", self.path, reason)
             self._mark_degraded(reason, quarantine_path=None)
             return ReadResult(status="degraded", reason=reason)
 
+        # Size gate BEFORE reading. MAX_STATE_FILE_BYTES exists to bound
+        # boot-time memory when the file is corrupt or supplied by an
+        # untrusted mount, so an oversized file must never be buffered in
+        # full: stat() is O(1), and the quarantine below moves the bytes
+        # (hard link, streaming-copy fallback) without reading them into
+        # memory either.
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            self._clear_degraded()
+            return ReadResult(status="missing")
+        except OSError as exc:
+            return _unreadable(exc)
+
         # Oversized file: do NOT attempt to parse (bound boot-time work).
         # Quarantine the bytes so the operator can inspect / trim them.
-        if len(raw) > MAX_STATE_FILE_BYTES:
+        if size > MAX_STATE_FILE_BYTES:
             reason = (
-                f"oversized state file ({len(raw)} bytes; max {MAX_STATE_FILE_BYTES})"
+                f"oversized state file ({size} bytes; max {MAX_STATE_FILE_BYTES})"
             )
             log.warning("netplot: %s: %s; quarantining", self.path, reason)
-            qpath = self._quarantine(raw)
+            qpath = self._quarantine()
+            self._mark_degraded(reason, quarantine_path=qpath)
+            return ReadResult(status="degraded", reason=reason, quarantine_path=qpath)
+
+        try:
+            with self.path.open("rb") as fh:
+                # Bounded read: the stat above admitted at most
+                # MAX_STATE_FILE_BYTES, but the file could grow between
+                # the stat and this read. Never buffer more than the cap
+                # plus one byte (the +1 lets the length check below
+                # distinguish "fits" from "grew past the cap").
+                raw = fh.read(MAX_STATE_FILE_BYTES + 1)
+        except FileNotFoundError:
+            self._clear_degraded()
+            return ReadResult(status="missing")
+        except OSError as exc:
+            return _unreadable(exc)
+
+        # Defense in depth for the stat->read race: a file that grew past
+        # the cap mid-read is still rejected without being parsed, and at
+        # most cap+1 bytes were ever buffered.
+        if len(raw) > MAX_STATE_FILE_BYTES:
+            reason = (
+                f"oversized state file ({len(raw)} bytes read; "
+                f"max {MAX_STATE_FILE_BYTES})"
+            )
+            log.warning("netplot: %s: %s; quarantining", self.path, reason)
+            qpath = self._quarantine()
             self._mark_degraded(reason, quarantine_path=qpath)
             return ReadResult(status="degraded", reason=reason, quarantine_path=qpath)
 
         # Try to parse. Any failure → degrade + quarantine the original
-        # bytes so the operator can recover them.
+        # bytes so the operator can recover them. RecursionError is not a
+        # ValueError subclass: json.loads raises it for deeply-nested
+        # input, and the byte cap above bounds size, not nesting depth.
         try:
             text = raw.decode("utf-8")
             payload = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
             reason = f"corrupt state file: {exc}"
             log.warning("netplot: %s: %s; quarantining", self.path, reason)
-            qpath = self._quarantine(raw)
+            qpath = self._quarantine()
             self._mark_degraded(reason, quarantine_path=qpath)
             return ReadResult(status="degraded", reason=reason, quarantine_path=qpath)
 
         if not isinstance(payload, dict):
             reason = "state file root is not an object"
             log.warning("netplot: %s: %s; quarantining", self.path, reason)
-            qpath = self._quarantine(raw)
+            qpath = self._quarantine()
             self._mark_degraded(reason, quarantine_path=qpath)
             return ReadResult(status="degraded", reason=reason, quarantine_path=qpath)
 
@@ -356,7 +398,7 @@ class PersistentStore:
         if unknown_state_keys:
             reason = f"unknown state field(s) {sorted(unknown_state_keys, key=repr)!r}"
             log.warning("netplot: %s: %s; quarantining", self.path, reason)
-            qpath = self._quarantine(raw)
+            qpath = self._quarantine()
             self._mark_degraded(reason, quarantine_path=qpath)
             return ReadResult(status="degraded", reason=reason, quarantine_path=qpath)
 
@@ -373,7 +415,7 @@ class PersistentStore:
                 f"unknown schema version {version!r} (expected {STATE_SCHEMA_VERSION})"
             )
             log.warning("netplot: %s: %s; quarantining", self.path, reason)
-            qpath = self._quarantine(raw)
+            qpath = self._quarantine()
             self._mark_degraded(reason, quarantine_path=qpath)
             return ReadResult(status="degraded", reason=reason, quarantine_path=qpath)
 
@@ -381,7 +423,7 @@ class PersistentStore:
         if not isinstance(raw_sessions, list):
             reason = "'sessions' is not a list"
             log.warning("netplot: %s: %s; quarantining", self.path, reason)
-            qpath = self._quarantine(raw)
+            qpath = self._quarantine()
             self._mark_degraded(reason, quarantine_path=qpath)
             return ReadResult(status="degraded", reason=reason, quarantine_path=qpath)
 
@@ -414,7 +456,7 @@ class PersistentStore:
                 self.path,
                 reason,
             )
-            qpath = self._quarantine(raw)
+            qpath = self._quarantine()
             self._mark_degraded(reason, quarantine_path=qpath)
             return ReadResult(
                 status="degraded",
@@ -518,17 +560,22 @@ class PersistentStore:
         self._degraded_reason = None
         self._quarantine_path = None
 
-    def _quarantine(self, raw: bytes) -> Path | None:
-        """Best-effort rename the current state file aside and return its path.
+    def _quarantine(self) -> Path | None:
+        """Best-effort move the current state file aside and return its path.
 
         The original bytes are preserved (as a sibling
         ``sessions.json.quarantine-<utc>`` file) so the operator can
         review the rejected definitions and recover them manually. The
-        rename (not copy) ensures a subsequent successful read cannot
-        re-trigger degraded from the same bytes. Best-effort: a failure
-        to rename is logged and ``None`` returned; the store still enters
-        degraded mode (writes refused) — the operator must investigate
-        the path directly in that case.
+        move (not in-place rewrite) ensures a subsequent successful read
+        cannot re-trigger degraded from the same bytes. Memory-safe for
+        ANY file size: the primary path hard-links the file (O(1), no
+        data copy), and the fallback for filesystems without links is an
+        exclusive, fsynced STREAMING copy — the whole file is never
+        buffered, so quarantining a hostile multi-GiB state file costs no
+        more than the copy's chunk buffer. Best-effort: a failure to move
+        is logged and ``None`` returned; the store still enters degraded
+        mode (writes refused) — the operator must investigate the path
+        directly in that case.
         """
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         try:
@@ -538,8 +585,9 @@ class PersistentStore:
             # could destroy the only retained copy of an earlier file.  Make
             # a unique quarantine copy first, then remove the source only
             # after that copy is complete.  Hard-linking is atomic and keeps
-            # the source intact until the final unlink; the exclusive-copy
-            # fallback covers filesystems that do not support links.
+            # the source intact until the final unlink; the exclusive
+            # streaming-copy fallback covers filesystems that do not
+            # support links.
             for suffix in range(1000):
                 extra = "" if suffix == 0 else f"-{suffix}"
                 target = self._dir / (f"{STATE_FILENAME}.quarantine-{stamp}{extra}")
@@ -549,19 +597,16 @@ class PersistentStore:
                     continue
                 except OSError:
                     try:
-                        fd = os.open(
-                            str(target),
-                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                            0o600,
-                        )
+                        # "xb" = O_EXCL create; copyfileobj streams in
+                        # bounded chunks so even an oversized source is
+                        # never fully buffered.
+                        with open(target, "xb") as dst, open(self.path, "rb") as src:
+                            shutil.copyfileobj(src, dst)
+                            dst.flush()
+                            os.fsync(dst.fileno())
                     except FileExistsError:
                         continue
-                    try:
-                        with os.fdopen(fd, "wb") as fh:
-                            fh.write(raw)
-                            fh.flush()
-                            os.fsync(fh.fileno())
-                    except BaseException:
+                    except OSError:
                         try:
                             target.unlink()
                         except OSError:

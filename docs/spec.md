@@ -85,6 +85,11 @@ named, and restart-safe.
   file, then restart — the re-read clears degraded when the file is gone
   or clean). ``/healthz`` surfaces ``persistence: "degraded"`` so
   monitoring can catch it. Boot never crashes on any file condition.
+  The oversized check runs on the file's size BEFORE any byte is read
+  (and the read itself is capped at one byte past the limit), and
+  quarantining moves the original bytes (hard link, streaming-copy
+  fallback) without buffering them, so boot-time memory stays bounded
+  no matter how large the on-disk file is.
 - **Restore on startup:** the ASGI lifespan reads the state file,
   recreates persistent sessions in file (insertion) order up to
   ``MAX_SESSIONS`` (the cap counts SUCCESSFUL registrations, not file
@@ -296,10 +301,22 @@ the configured interval; within a round all hop probes run concurrently.
   then the CSV text is built OFF the event loop via ``asyncio.to_thread`` so
   a max-size export (~310k rows: 30 hops × 10k + a separate 10k target
   stream) does not stall other requests for the ~0.5 s the build takes. A
-  per-process bounded semaphore (limit 2) wraps both phases; a request that
-  finds both slots held gets **HTTP 429** with ``Retry-After: 2`` rather
-  than queueing, so a client cannot stack stalls or retain unbounded
-  response-body memory via concurrent slow downloads.
+  per-process bounded semaphore (limit 2) is held for the response's whole
+  lifetime — capture, serialization, and every ASGI body send up to and
+  including the terminal zero-length chunk — so a slow or stalled download
+  cannot park a finished body while further exports are admitted; a request
+  that finds both slots held gets **HTTP 429** with ``Retry-After: 2``
+  rather than queueing. Each in-flight transfer runs under a generous total
+  transfer deadline (``EXPORT_TRANSFER_DEADLINE_S`` = 120 s, covering the
+  status line, headers, and all body chunks): a client (or fronting peer)
+  that stops reading has its transfer aborted mid-body at the deadline —
+  the client sees a truncated response, never a completed CSV — and the
+  slot is returned on every exit path (completion, error, disconnect,
+  cancellation, deadline). The body is sent in bounded chunks (256 KiB,
+  transparently — the concatenated bytes are exactly the CSV build) so one
+  export does not become a single multi-MiB transport write. Retained
+  response-body memory is thereby bounded to 2 in-flight bodies, each held
+  for at most the transfer deadline.
 
   **Exposure:** export returns the FULL server-retained history per stream
   (up to ``SAMPLE_CAP`` = 10 000 samples, ≈ hours at the default 2.5 s
@@ -441,7 +458,14 @@ the configured interval; within a round all hop probes run concurrently.
   ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` and platform defaults.
   Malformed payloads (wrong shapes,
   non-finite timestamps, negative bandwidth) surface as **502**-mapped
-  errors, never uncaught exceptions. **400** on missing/non-numeric/
+  errors, never uncaught exceptions. A destination URL that survives the
+  settings grammar but that the HTTP client itself rejects at request-build
+  time (e.g. an IDNA-unencodable host such as the reserved ``☃.example``)
+  is likewise mapped to a **502** ``InfluxError`` ("invalid destination
+  URL") — never an unhandled **500**; rejecting such hosts at save time is
+  deliberately out of scope (no URL-grammar tightening or settings
+  migration in this bounded version), so the controlled **502** is the contract for
+  accepted-but-unusable destinations. **400** on missing/non-numeric/
   negative params, ``start > end``, span > 24 h, or when unconfigured;
   **502** when unreachable/erroring/ambiguous. **Admission:** at most
   **4 active throughput queries per process**
@@ -465,7 +489,11 @@ the configured interval; within a round all hop probes run concurrently.
   (both checks happen before the stream starts, so no 200 is sent for a
   rejected subscriber). A client disconnect or task cancellation
   releases both the process slot and the session subscription — streams
-  abandoned mid-response cannot wedge admission.
+  abandoned mid-response cannot wedge admission. SSE responses
+  deliberately carry **no transfer deadline** (unlike CSV export, whose
+  120 s budget exists only to bound finite downloads): the streams are
+  intentionally long-lived and are kept alive by the 15 s keepalive
+  comments above.
 
   Chosen over WebSocket: one-way push, simpler, native `EventSource` in the
   browser.

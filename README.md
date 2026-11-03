@@ -64,12 +64,12 @@ the commands here only use your own local `gh`/`docker` binaries.
 
 ```bash
 mkdir netplot && cd netplot
-curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.0/docker-compose.yml \
+curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.1/docker-compose.yml \
   -o docker-compose.yml
-printf 'NETPLOT_VERSION=0.1.0\n' > .env
+printf 'NETPLOT_VERSION=0.1.1\n' > .env
 ```
 
-The Compose file and image are both pinned to the `v0.1.0` release; `.env`
+The Compose file and image are both pinned to the `v0.1.1` release; `.env`
 keeps the selected image version across later commands. Substitute another
 published stable `vX.Y.Z` tag and matching `X.Y.Z` image version if desired.
 Downloading the Compose file needs no GitHub login; pulling the private
@@ -83,7 +83,7 @@ docker compose up -d
 
 Open **http://127.0.0.1:8000**, enter a target (DNS name or IP), pick an
 interval, and press the green **Play** button. The first start pulls
-`ghcr.io/jschert/netplot:0.1.0` for your host (`linux/amd64` or
+`ghcr.io/jschert/netplot:0.1.1` for your host (`linux/amd64` or
 `linux/arm64`). A `denied`/`not found` error means either your account
 lacks access or the selected tag is unavailable.
 
@@ -94,7 +94,7 @@ in a `.env` file next to it to make them stick:
 
 | Variable                | Default                     | Purpose                                                                   |
 | ----------------------- | --------------------------- | ------------------------------------------------------------------------- |
-| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.0`                                           |
+| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.1`                                           |
 | `NETPLOT_BIND_ADDRESS`  | `127.0.0.1`                 | Host interface the published port binds to                                |
 | `NETPLOT_PORT`          | `8000`                      | Host port                                                                 |
 | `NETPLOT_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1`   | Extra exact Host values to accept, e.g. `netplot.example` (see *LAN access*) |
@@ -102,7 +102,7 @@ in a `.env` file next to it to make them stick:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.0
+NETPLOT_VERSION=0.1.1
 NETPLOT_BIND_ADDRESS=127.0.0.1
 NETPLOT_PORT=8000
 ```
@@ -151,13 +151,39 @@ Set `NETPLOT_ALLOWED_HOSTS` to additional exact comma-separated hostnames/IPs cl
 use (no schemes, ports, or wildcards; IPv6 addresses without brackets). The
 loopback hosts `localhost,127.0.0.1,::1` are always allowed, including for
 the container health check. This also applies to native installs.
-Unlisted Host headers return 400; browser mutations from another origin
-return 403. CLI clients without an Origin header remain supported. For a
-reverse proxy, preserve Host and configure the externally visible hostname;
-only trust forwarded scheme headers from that proxy (see *Reverse proxy*
-below for the full setup). Shared deployments
-should use an authenticating reverse proxy and prevent direct backend access.
-Host/Origin validation does not provide user authentication.
+Unlisted Host headers return 400. Browser requests from another origin
+return 403 — this includes cross-site *and same-site sibling-origin*
+subresource reads such as `<img>`, `<script>`, `fetch()`, and EventSource
+loads driven by a visited page (a sibling origin is a different origin
+sharing your registrable domain, e.g. `other.netplot.example` next to
+`netplot.example` under a wildcard DNS zone), not just form/scripted
+mutations, so another web page cannot make this server query its
+configured InfluxDB or pull dashboard responses.
+Top-level navigation still works (typed address, bookmark, or a followed
+link from another site), as do the dashboard's own same-origin requests
+and CLI/monitoring clients (curl, Prometheus) that send no browser
+metadata at all. The dashboard also refuses cross-origin framing
+(`X-Frame-Options: SAMEORIGIN` + `Content-Security-Policy:
+frame-ancestors 'self'`) while same-origin embedding keeps working; no
+legitimate cross-origin embedding of the unauthenticated UI is supported.
+These are browser boundaries, not access control: they depend on standard
+browser metadata (Fetch Metadata/Origin headers) and framing enforcement,
+so they do not protect against non-browser or modified clients — keep the
+service on trusted networks. For a reverse proxy, preserve Host and
+configure the externally visible hostname; only trust forwarded scheme
+headers from that proxy (see *Reverse proxy* below for the full setup).
+Shared deployments should use an authenticating reverse proxy and prevent
+direct backend access. Host/Origin validation does not provide user
+authentication.
+
+Request bodies are capped at 1 MiB and the cap is enforced *before*
+parsing: a larger declared body is refused with 413 (a malformed or
+self-contradicting `Content-Length` with 400) before the server allocates
+or parses it, and streamed (chunked) bodies are refused with the same 413
+the moment their running total crosses the cap — never masked as an
+ordinary body-parse 400. Every netplot endpoint exchanges small JSON
+bodies, so no legitimate client — dashboard, curl, or monitoring — sends
+anywhere near the cap.
 
 Throughput queries allow four concurrent requests per process and have a
 five-second total deadline; excess requests receive 429 with Retry-After.
@@ -199,7 +225,7 @@ next to `docker-compose.yml` and they apply on every `docker compose up -d`:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.0
+NETPLOT_VERSION=0.1.1
 NETPLOT_ALLOWED_HOSTS=netplot.example
 FORWARDED_ALLOW_IPS=192.0.2.10
 ```
@@ -237,7 +263,7 @@ docker run -d --name netplot \
   -p 127.0.0.1:8000:8000 \
   -v netplot-data:/data \
   --restart unless-stopped \
-  ghcr.io/jschert/netplot:0.1.0
+  ghcr.io/jschert/netplot:0.1.1
 ```
 
 ## Route-origin caveat (containers)

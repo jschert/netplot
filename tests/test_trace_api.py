@@ -1073,6 +1073,336 @@ def test_export_semaphore_is_released_after_error_path() -> None:
         assert client.get(f"/api/traces/{sid}/export").status_code == 200
 
 
+# --------------------------- export response-lifetime slot ownership
+#
+# The export slot must be owned by the RESPONSE, not the body iterator.
+# Releasing capacity in the body generator's ``finally`` would be wrong:
+# that hook runs after the last DATA chunk send but BEFORE the terminal
+# ASGI ``http.response.body`` (zero-length, more_body=False) send
+# completes. Under write backpressure (uvicorn's send awaits flow-control
+# drain once the transport write buffer fills — see the pinned uvicorn
+# send source), two exports parked at their terminal send would show both
+# slots FREE while the transfers are still live, and a third export would
+# be admitted. TestClient buffers the whole body and cannot pause
+# mid-response, so these tests drive the raw ASGI app with controllable
+# ``send`` callables to pin the consumer-visible contract: admission is
+# held until the response fully completes (or errors / disconnects / hits
+# the transfer deadline), then returned exactly once.
+
+
+def _asgi_scope(path: str, query: str = "") -> dict:
+    """Minimal valid HTTP/1.1 ASGI scope for driving the app directly."""
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": query.encode("ascii"),
+        "root_path": "",
+        "headers": [(b"host", b"localhost")],
+        "client": ("127.0.0.1", 60000),
+        "server": ("localhost", 80),
+    }
+
+
+async def _drive_asgi(app, scope: dict, send) -> None:
+    """Run one request through the full ASGI stack with a never-ending
+    ``receive`` (no client disconnect unless the driving task is cancelled —
+    exactly how a live connection behaves while the response streams)."""
+
+    async def receive() -> dict:
+        await asyncio.Event().wait()
+        return {"type": "http.disconnect"}
+
+    await app(scope, receive, send)
+
+
+def _send_parked_at_terminal(record: list, parked: asyncio.Event, gate: asyncio.Event):
+    """ASGI send that completes normally except for the terminal
+    ``http.response.body`` send (more_body=False), which blocks until
+    ``gate`` is set — the write-backpressure park from the confirmed
+    ownership bug."""
+
+    async def send(message) -> None:
+        record.append(message)
+        if message["type"] == "http.response.body" and not message.get(
+            "more_body", False
+        ):
+            parked.set()
+            await gate.wait()
+
+    return send
+
+
+def _send_recording(record: list):
+    async def send(message) -> None:
+        record.append(message)
+
+    return send
+
+
+def _status_of(record: list) -> int:
+    return next(m for m in record if m["type"] == "http.response.start")["status"]
+
+
+def _body_bytes(record: list) -> bytes:
+    return b"".join(
+        m.get("body", b"") for m in record if m["type"] == "http.response.body"
+    )
+
+
+def test_export_admission_held_through_terminal_send(tmp_path) -> None:
+    """Two exports parked at their terminal ASGI body send keep BOTH slots
+    held — a third export gets 429 + Retry-After — and capacity returns only
+    once the parked transfers complete, each delivering the complete,
+    byte-exact CSV. Before the response-ownership fix the third export was
+    admitted (200) while two transfers were still live."""
+    from netplot.web import _samples_csv_from_snapshot
+
+    async def run() -> None:
+        app = create_app(data_dir=tmp_path)
+        manager = app.state.session_manager
+        session = manager.create("127.0.0.1", interval_s=60.0)
+        session.target_ip = "127.0.0.1"
+        session.append_sample(1.5, t=1000.0)
+        expected = _samples_csv_from_snapshot(session.export_snapshot())
+        export_path = f"/api/traces/{session.id}/export"
+
+        records: list[list] = [[], []]
+        parked = [asyncio.Event(), asyncio.Event()]
+        gates = [asyncio.Event(), asyncio.Event()]
+        tasks = [
+            asyncio.create_task(
+                _drive_asgi(
+                    app,
+                    _asgi_scope(export_path),
+                    _send_parked_at_terminal(records[i], parked[i], gates[i]),
+                )
+            )
+            for i in range(2)
+        ]
+        await asyncio.wait_for(parked[0].wait(), 5)
+        await asyncio.wait_for(parked[1].wait(), 5)
+        # Both transfers are alive, parked at the final send: both export
+        # slots are still held, so the next export must be rejected.
+        assert app.state.export_semaphore._value == 0
+        third: list = []
+        await _drive_asgi(app, _asgi_scope(export_path), _send_recording(third))
+        assert _status_of(third) == 429
+        assert any(
+            k.lower() == b"retry-after" and v == b"2"
+            for k, v in next(
+                m for m in third if m["type"] == "http.response.start"
+            )["headers"]
+        )
+
+        # Completing the parked terminal sends returns capacity, and each
+        # parked client received the whole file.
+        gates[0].set()
+        gates[1].set()
+        await asyncio.wait_for(tasks[0], 5)
+        await asyncio.wait_for(tasks[1], 5)
+        assert app.state.export_semaphore._value == 2
+        for record in records:
+            assert _body_bytes(record).decode("utf-8") == expected
+            assert any(
+                m["type"] == "http.response.body" and not m.get("more_body", False)
+                for m in record
+            ), "a finished export must complete its terminal send"
+
+        # Capacity recovered: a fresh export succeeds with the same body.
+        fourth: list = []
+        await _drive_asgi(app, _asgi_scope(export_path), _send_recording(fourth))
+        assert _status_of(fourth) == 200
+        assert _body_bytes(fourth).decode("utf-8") == expected
+
+    asyncio.run(run())
+
+
+def test_export_disconnect_at_terminal_send_returns_capacity(tmp_path) -> None:
+    """Cancelling the driving task at the terminal send (client disconnect
+    during a backpressured transfer) returns the export slot so later
+    exports are not wedged."""
+    from netplot.web import _samples_csv_from_snapshot
+
+    async def run() -> None:
+        app = create_app(data_dir=tmp_path)
+        manager = app.state.session_manager
+        session = manager.create("127.0.0.1", interval_s=60.0)
+        session.target_ip = "127.0.0.1"
+        session.append_sample(1.0, t=1000.0)
+        export_path = f"/api/traces/{session.id}/export"
+
+        parked = [asyncio.Event(), asyncio.Event()]
+        gates = [asyncio.Event(), asyncio.Event()]
+        tasks = [
+            asyncio.create_task(
+                _drive_asgi(
+                    app,
+                    _asgi_scope(export_path),
+                    _send_parked_at_terminal([], parked[i], gates[i]),
+                )
+            )
+            for i in range(2)
+        ]
+        await asyncio.wait_for(parked[0].wait(), 5)
+        await asyncio.wait_for(parked[1].wait(), 5)
+        assert app.state.export_semaphore._value == 0
+
+        for task in tasks:
+            task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        assert all(isinstance(r, asyncio.CancelledError) for r in results)
+        assert app.state.export_semaphore._value == 2
+
+        # Admission recovered: a new export completes normally.
+        record: list = []
+        await _drive_asgi(app, _asgi_scope(export_path), _send_recording(record))
+        assert _status_of(record) == 200
+        assert (
+            _body_bytes(record).decode("utf-8")
+            == _samples_csv_from_snapshot(session.export_snapshot())
+        )
+
+    asyncio.run(run())
+
+
+def test_export_transfer_deadline_aborts_stalled_body_and_returns_slot(
+    tmp_path, monkeypatch
+) -> None:
+    """A client that stops reading mid-transfer is cut off by the total
+    transfer deadline: the response fails with TimeoutError, the client is
+    left holding a strict prefix of the CSV (never a completed file), the
+    slot is returned, and subsequent exports work."""
+    from netplot import web as web_mod
+    from netplot.web import _samples_csv_from_snapshot
+
+    monkeypatch.setattr(web_mod, "EXPORT_TRANSFER_DEADLINE_S", 0.25)
+
+    async def run() -> None:
+        app = create_app(data_dir=tmp_path)
+        manager = app.state.session_manager
+        session = manager.create("127.0.0.1", interval_s=60.0)
+        session.target_ip = "127.0.0.1"
+        for i in range(8000):  # > EXPORT_CHUNK_CHARS: multi-chunk body
+            session.samples.append(Sample(t=float(1_700_000_000 + i), rtt_ms=1.0))
+        expected = _samples_csv_from_snapshot(session.export_snapshot())
+        assert len(expected) > web_mod.EXPORT_CHUNK_CHARS
+        export_path = f"/api/traces/{session.id}/export"
+
+        record: list = []
+        first_chunk_delivered = asyncio.Event()
+        stall_forever = asyncio.Event()
+
+        async def stalling_send(message) -> None:
+            # Only messages whose send COMPLETES are recorded, so ``record``
+            # is exactly what the client actually received.
+            if message["type"] == "http.response.start":
+                record.append(message)
+                return
+            if (
+                message["type"] == "http.response.body"
+                and message.get("body")
+                and not first_chunk_delivered.is_set()
+            ):
+                first_chunk_delivered.set()
+                record.append(message)
+                return
+            await stall_forever.wait()  # later chunks / terminal: never read
+
+        task = asyncio.create_task(
+            _drive_asgi(app, _asgi_scope(export_path), stalling_send)
+        )
+        await asyncio.wait_for(first_chunk_delivered.wait(), 5)
+        done, _pending = await asyncio.wait({task}, timeout=5.0)
+        assert task in done, "stalled export transfer was not cut off by its deadline"
+        assert isinstance(task.exception(), TimeoutError)
+        assert app.state.export_semaphore._value == 2
+
+        received = _body_bytes(record).decode("utf-8")
+        assert received == expected[: len(received)]  # strict prefix
+        assert len(received) < len(expected)  # truncated, not a complete CSV
+        assert not any(
+            m["type"] == "http.response.body" and not m.get("more_body", False)
+            for m in record
+        ), "an aborted transfer must not report a terminal (complete) send"
+
+        # Capacity returned: a fresh export serves the complete file.
+        fresh: list = []
+        await _drive_asgi(app, _asgi_scope(export_path), _send_recording(fresh))
+        assert _status_of(fresh) == 200
+        assert _body_bytes(fresh).decode("utf-8") == expected
+
+    asyncio.run(run())
+
+
+def test_sse_stream_is_not_subject_to_the_export_transfer_deadline(
+    tmp_path, monkeypatch
+) -> None:
+    """SSE is intentionally long-lived: an events stream must survive far
+    past the (patched, tiny) export transfer deadline, while still releasing
+    its admission + subscription when the client goes away."""
+    from netplot import web as web_mod
+
+    monkeypatch.setattr(web_mod, "EXPORT_TRANSFER_DEADLINE_S", 0.2)
+
+    async def run() -> None:
+        app = create_app(data_dir=tmp_path)
+        manager = app.state.session_manager
+        session = manager.create("127.0.0.1", interval_s=60.0)
+        frames: list[bytes] = []
+
+        async def send(message) -> None:
+            if message["type"] == "http.response.body":
+                frames.append(message.get("body", b""))
+
+        task = asyncio.create_task(
+            _drive_asgi(app, _asgi_scope(f"/api/traces/{session.id}/events"), send)
+        )
+
+        async def prelude_arrived() -> None:
+            while not any(b"event: ready" in f for f in frames):
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(prelude_arrived(), 5)
+        # Well past the patched export deadline the SSE stream must still
+        # be alive: the CSV transfer deadline does not apply to SSE.
+        await asyncio.sleep(0.6)
+        assert not task.done(), "SSE stream must not carry the CSV transfer deadline"
+        # Disconnect (cancel) still returns admission + subscription.
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert app.state.sse_semaphore._value == web_mod.SSE_CONCURRENCY_LIMIT
+        assert not session._subscribers
+
+    asyncio.run(run())
+
+
+def test_export_large_csv_is_byte_exact_across_chunks() -> None:
+    """The body is chunked for transport, but the received bytes must be
+    exactly the CSV build — no seams, no reordering, no truncation."""
+    from netplot import web as web_mod
+    from netplot.web import _samples_csv_from_snapshot
+
+    with TestClient(create_app(), base_url="http://localhost") as client:
+        sid = _create_then(client)
+        session = client.app.state.session_manager.get(sid)
+        client.post(f"/api/traces/{sid}/pause")
+        session.target_ip = "127.0.0.1"
+        for i in range(8000):
+            session.samples.append(Sample(t=float(1_700_000_000 + i), rtt_ms=1.0))
+        expected = _samples_csv_from_snapshot(session.export_snapshot())
+        assert len(expected) > web_mod.EXPORT_CHUNK_CHARS  # multi-chunk body
+
+        r = client.get(f"/api/traces/{sid}/export?format=csv")
+        assert r.status_code == 200
+        assert r.text == expected
+
+
 # -------------------------------------- off-loop serialization phase split
 #
 # export_trace runs in two phases: (1) export_snapshot() captures the live
