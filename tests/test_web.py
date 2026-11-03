@@ -29,6 +29,12 @@ def test_root_dashboard_contains_controls() -> None:
     assert 'id="focus-caption"' in body
     # Slice 4 additions: reset control + per-hop table.
     assert 'id="reset"' in body
+    # Copy summary (target-only plain text) toolbar control + its own
+    # aria-live feedback line (kept separate from the trace status line).
+    assert 'id="copy-summary"' in body
+    assert "Copy summary" in body
+    assert 'id="copy-summary-status"' in body
+    assert 'aria-live="polite"' in body
     assert 'id="hop-table"' in body
     assert 'id="hop-table-body"' in body
     assert 'id="status-line"' in body

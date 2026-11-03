@@ -64,12 +64,12 @@ the commands here only use your own local `gh`/`docker` binaries.
 
 ```bash
 mkdir netplot && cd netplot
-curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.1/docker-compose.yml \
+curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.2/docker-compose.yml \
   -o docker-compose.yml
-printf 'NETPLOT_VERSION=0.1.1\n' > .env
+printf 'NETPLOT_VERSION=0.1.2\n' > .env
 ```
 
-The Compose file and image are both pinned to the `v0.1.1` release; `.env`
+The Compose file and image are both pinned to the `v0.1.2` release; `.env`
 keeps the selected image version across later commands. Substitute another
 published stable `vX.Y.Z` tag and matching `X.Y.Z` image version if desired.
 Downloading the Compose file needs no GitHub login; pulling the private
@@ -83,7 +83,7 @@ docker compose up -d
 
 Open **http://127.0.0.1:8000**, enter a target (DNS name or IP), pick an
 interval, and press the green **Play** button. The first start pulls
-`ghcr.io/jschert/netplot:0.1.1` for your host (`linux/amd64` or
+`ghcr.io/jschert/netplot:0.1.2` for your host (`linux/amd64` or
 `linux/arm64`). A `denied`/`not found` error means either your account
 lacks access or the selected tag is unavailable.
 
@@ -94,7 +94,7 @@ in a `.env` file next to it to make them stick:
 
 | Variable                | Default                     | Purpose                                                                   |
 | ----------------------- | --------------------------- | ------------------------------------------------------------------------- |
-| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.1`                                           |
+| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.2`                                           |
 | `NETPLOT_BIND_ADDRESS`  | `127.0.0.1`                 | Host interface the published port binds to                                |
 | `NETPLOT_PORT`          | `8000`                      | Host port                                                                 |
 | `NETPLOT_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1`   | Extra exact Host values to accept, e.g. `netplot.example` (see *LAN access*) |
@@ -102,7 +102,7 @@ in a `.env` file next to it to make them stick:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.1
+NETPLOT_VERSION=0.1.2
 NETPLOT_BIND_ADDRESS=127.0.0.1
 NETPLOT_PORT=8000
 ```
@@ -225,7 +225,7 @@ next to `docker-compose.yml` and they apply on every `docker compose up -d`:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.1
+NETPLOT_VERSION=0.1.2
 NETPLOT_ALLOWED_HOSTS=netplot.example
 FORWARDED_ALLOW_IPS=192.0.2.10
 ```
@@ -263,7 +263,7 @@ docker run -d --name netplot \
   -p 127.0.0.1:8000:8000 \
   -v netplot-data:/data \
   --restart unless-stopped \
-  ghcr.io/jschert/netplot:0.1.1
+  ghcr.io/jschert/netplot:0.1.2
 ```
 
 ## Route-origin caveat (containers)
@@ -351,7 +351,7 @@ policy, and `netplot-data` volume still come from the base file. A bare
 
 ### Endpoints
 
-- `GET /` serves the dashboard UI: a PingPlotter-style toolbar (Play/Pause split, target combobox with recent-targets history, interval preset dropdown, Focus window dropdown, disabled ICMP packet-type dropdown, focus caption line), a live hop table (status / Hop / Count / IP / DNS / Avg / Min / Cur / PL% / Graph), and per-hop latency timeline graphs driven by SSE. The Graph column shows shared 100/200 ms zones, min–max whiskers, average/current markers, packet-loss hatching, and an average connector. The target timeline is always shown; double-click any hop row to add or remove a timeline for that hop. Drag a region on any timeline to focus the table stats on that period (the Focus dropdown is the rolling-window size; manual drag-focus overrides it until cleared). Pausing a trace freezes the view (timelines, stats, focus caption) at the server-recorded pause time; resuming continues from current wall time.
+- `GET /` serves the dashboard UI: a PingPlotter-style toolbar (Play/Pause split, target combobox with recent-targets history, interval preset dropdown, Focus window dropdown, disabled ICMP packet-type dropdown, focus caption line), a live hop table (status / Hop / Count / IP / DNS / Avg / Min / Cur / PL% / Graph), and per-hop latency timeline graphs driven by SSE. The Graph column shows shared 100/200 ms zones, min–max whiskers, average/current markers, packet-loss hatching, and an average connector. The target timeline is always shown; double-click any hop row to add or remove a timeline for that hop. Drag a region on any timeline to focus the table stats on that period (the Focus dropdown is the rolling-window size; manual drag-focus overrides it until cleared). Pausing a trace freezes the view (timelines, stats, focus caption) at the server-recorded pause time; resuming continues from current wall time. The **Copy summary** toolbar button copies a plain-text summary of the active trace's target: the Focus/drag-selected window in UTC, probe interval, target avg/min/max RTT and packet loss — exactly the values the table shows for that window, with the Mask internal DNS toggle respected.
 - `GET /static/app.js`, `GET /static/style.css` serve the dashboard assets.
 - `GET /healthz` returns a simple readiness payload.
 - `POST /api/traces` creates and starts a continuous trace against a target (host or IP); route discovery and concurrent per-hop probing begin automatically. See `docs/spec.md` for the full snapshot/SSE contract.

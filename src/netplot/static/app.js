@@ -704,6 +704,18 @@
       return (d.getMonth() + 1) + "/" + d.getDate() + "/" + d.getFullYear();
     },
 
+    /** Epoch seconds -> "2026-06-10 17:36:23 UTC"; copied text labels the zone. */
+    formatUtcStamp: function (s) {
+      if (s === null || s === undefined || typeof s !== "number" || isNaN(s)) {
+        return "—";
+      }
+      var d = new Date(s * 1000);
+      function p(n) { return String(n).padStart(2, "0"); }
+      return d.getUTCFullYear() + "-" + p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) +
+        " " + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" +
+        p(d.getUTCSeconds()) + " UTC";
+    },
+
     /**
      * Build the Focus caption line shown under the toolbar:
      *   "Focus: <windowLabel>, <date>, <startTime> - <endTime>"
@@ -1082,6 +1094,19 @@
 
   PURE.statsForHop = function (sampleState, hopIndex, nowS) {
     return PURE.statsForHopWindow(sampleState, hopIndex, nowS, FOCUS_S);
+  };
+
+  // Stats exactly as the table shows them (a manual drag-focus window overrides
+  // the rolling window); shared by the table and the copied summary.
+  PURE.displayStatsForHop = function (sampleState, hopIndex, nowS, focusS) {
+    var focus = sampleState && sampleState.focus;
+    if (focus) {
+      var list = (sampleState.samples || {})[String(hopIndex)] || [];
+      var d = PURE.computeStatsRange(list, focus.startS, focus.endS);
+      if (d.count === 0) return null;
+      return { source: "focus", data: d };
+    }
+    return PURE.statsForHopWindow(sampleState || {}, hopIndex, nowS, focusS);
   };
 
   // ----- Slice 7 (multi-trace tabs): pure tab-state helpers -----------
@@ -1689,6 +1714,114 @@
     return false;
   };
 
+  // Button enable predicate: a bound session AND usable target stats in the
+  // selected window (idle/reset tabs and empty windows stay disabled).
+  PURE.summaryEnabled = function (view) {
+    view = view || {};
+    if (!view.sessionId) return false;
+    return !!(view.stats && view.stats.count > 0);
+  };
+
+  // Mask-aware label for the target stream in copied text.
+  PURE.summaryTargetLabel = function (hop, isInternal, maskOn, names) {
+    var h = hop || {};
+    var name = h.dns || h.ip || "";
+    if (h.dns) name = PURE.maskDnsName(name, !!isInternal, maskOn);
+    return PURE.maskSessionLabel(name, names || [], maskOn) || "unknown";
+  };
+
+  // Plain-text summary of the CURRENT TARGET for the selected window, built
+  // from the statistics the table already shows, so the text never overstates
+  // coverage. Returns null when there is nothing usable to copy.
+  //
+  // ``seedHasMax``: a snapshot baseline without max_ms leaves a combined
+  // statistic's max delta-only, which is not a full-window maximum, so it is
+  // reported unavailable instead of overstated.
+  PURE.buildTargetSummary = function (view) {
+    view = view || {};
+    var stats = view.stats;
+    if (!stats || !(stats.count > 0)) return null;
+    function fmt(v) {
+      if (v === null || v === undefined || (typeof v === "number" && isNaN(v))) return "n/a";
+      return Number(v).toFixed(1);
+    }
+    var max = stats.max;
+    var maxNote = null;
+    if (view.source === "combined" && !view.seedHasMax) {
+      max = null;
+      maxNote = "max unavailable: the baseline statistics carry no max, " +
+        "and the recent-sample max alone does not cover the window";
+    }
+    var intervalS = Number(view.intervalS);
+    var lines = [
+      "netplot trace summary",
+      "Target: " + (view.target ? String(view.target) : "unknown"),
+      "Window: " + (view.windowLabel || "unknown") +
+        ", " + PURE.formatUtcStamp(view.startS) + " - " + PURE.formatUtcStamp(view.endS),
+      "Probe interval: " + (isFinite(intervalS) && intervalS > 0 ? intervalS + " s" : "n/a"),
+      "RTT avg/min/max (ms): " + fmt(stats.avg) + " / " + fmt(stats.min) + " / " + fmt(max),
+    ];
+    var loss = "Packet loss: " + fmt(stats.lossPct) + "%";
+    // Lost-probe counts are only recoverable from count*PL% when that product
+    // is an integer. A blended baseline+delta ratio may not be, so the count is
+    // omitted rather than rounded into a fabricated integer.
+    var lost = stats.count * Number(stats.lossPct) / 100;
+    if (isFinite(lost) && Math.abs(lost - Math.round(lost)) < 1e-6) {
+      loss += " (lost " + Math.round(lost) + " of " + stats.count + " probes)";
+    } else {
+      loss += " (" + stats.count + " probes)";
+    }
+    lines.push(loss);
+    if (maxNote) lines.push("Note: " + maxNote);
+    return lines.join("\n");
+  };
+
+  // ----- clipboard (Copy summary) -------------------------------------
+
+  /**
+   * Copy ``text`` via the async Clipboard API, falling back to
+   * execCommand("copy") when the page has no such API (plain-HTTP LAN) or it
+   * rejects. Resolves true/false and never reports success when nothing was
+   * copied. ``clipboard``/``doc`` are injected so the tests need no browser.
+   */
+  PURE.copyPlainText = function (opts) {
+    opts = opts || {};
+    var text = String(opts.text == null ? "" : opts.text);
+    var doc = opts.doc || null;
+    var clipboard = opts.clipboard || null;
+    function legacy() { return PURE.execCommandCopy(doc, text); }
+    if (clipboard && typeof clipboard.writeText === "function") {
+      return Promise.resolve()
+        .then(function () { return clipboard.writeText(text); })
+        .then(function () { return true; }, function () { return legacy(); });
+    }
+    return Promise.resolve(legacy());
+  };
+
+  /** Legacy path: temporary off-screen textarea, execCommand("copy"), cleanup. */
+  PURE.execCommandCopy = function (doc, text) {
+    if (!doc || typeof doc.createElement !== "function" || !doc.body) return false;
+    var ta = doc.createElement("textarea");
+    ta.value = String(text == null ? "" : text);
+    ta.setAttribute("readonly", "");
+    if (ta.style) {
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+    }
+    var prev = doc.activeElement || null;
+    var ok = false;
+    doc.body.appendChild(ta);
+    try {
+      if (typeof ta.select === "function") ta.select();
+      ok = !!doc.execCommand("copy");
+    } catch (e) {
+      ok = false;
+    }
+    try { doc.body.removeChild(ta); } catch (e2) { /* already detached */ }
+    if (prev && typeof prev.focus === "function") prev.focus();
+    return ok;
+  };
+
   // Overlay-on-activate fetch predicate: a tab activating with an
   // enabled + configured overlay but NO points fetches now — e.g. one
   // cleared by an Influx settings save while backgrounded (only the
@@ -1760,6 +1893,8 @@
     focusCaption: document.getElementById("focus-caption"),
     reset: document.getElementById("reset"),
     exportBtn: document.getElementById("export"),
+    copySummary: document.getElementById("copy-summary"),
+    copySummaryStatus: document.getElementById("copy-summary-status"),
     status: document.getElementById("status"),
     routeBanner: document.getElementById("route-banner"),
     tableBody: document.getElementById("hop-table-body"),
@@ -2485,13 +2620,7 @@
     // ----- focus window -------------------------------------------------
 
     function statsForHopDisplay(hopIndex, nowS) {
-      if (state.focus) {
-        var list = state.samples[String(hopIndex)] || [];
-        var d = PURE.computeStatsRange(list, state.focus.startS, state.focus.endS);
-        if (d.count === 0) return null;
-        return { source: "focus", data: d };
-      }
-      return statsForHop(hopIndex, nowS);
+      return PURE.displayStatsForHop(state, hopIndex, nowS, currentFocusSeconds());
     }
 
     function checkFocusExpiry(nowS) {
@@ -3797,6 +3926,9 @@
       if (!isActive()) return;
       var nowS = effNowS();
       checkFocusExpiry(nowS);
+      // Every repaint (drag-focus, Focus dropdown, snapshot, SSE round,
+      // hydrated baseline) also re-derives copy-summary availability.
+      refreshCopySummaryButton();
       var displayHops = state.hops.slice();
       if (displayHops.length === 0 && (state.routeState === "pending" || state.routeState === "failed") &&
           (state.samples["0"] || state.seedStats["0"])) {
@@ -4050,6 +4182,7 @@
           els.backgroundToggle.checked = false;
         }
         refreshExportButton();
+        refreshCopySummaryButton();
         return;
       }
       // Active session: Play acts as Resume when paused (idle when running),
@@ -4074,6 +4207,7 @@
         els.backgroundToggle.checked = !!state.persistent;
       }
       refreshExportButton();
+      refreshCopySummaryButton();
     }
 
     // Export button follows sample availability: enabled only when the
@@ -4085,6 +4219,21 @@
     function refreshExportButton() {
       if (!isActive()) return;
       if (els.exportBtn) els.exportBtn.disabled = !PURE.exportEnabled(state);
+    }
+
+    // Copy summary needs usable target stats for the selected window, like the
+    // summary text itself.
+    function refreshCopySummaryButton() {
+      if (!isActive() || !els.copySummary) return;
+      var stats = statsForHopDisplay(primaryHopIndex(), effNowS());
+      var enabled = PURE.summaryEnabled({
+        sessionId: state.sessionId,
+        stats: stats ? stats.data : null,
+      });
+      els.copySummary.disabled = !enabled;
+      // Stale feedback from another trace must not linger on a disabled
+      // control.
+      if (!enabled && els.copySummaryStatus) els.copySummaryStatus.textContent = "";
     }
 
     // ----- SSE ----------------------------------------------------------
@@ -4684,6 +4833,60 @@
         });
     }
 
+    // ----- Copy summary (target-only plain text) -----------------------
+
+    /** Display name of the target stream for copied text (mask-aware). */
+    function summaryTargetLabel(hopIndex) {
+      var hop = findHop(hopIndex);
+      return PURE.summaryTargetLabel(
+        hop,
+        hopInternal(hop),
+        maskState.on,
+        sessionMaskNames()
+      );
+    }
+
+    // The same stats + window the table shows; ``effNowS`` keeps a paused
+    // trace's copied window frozen.
+    function targetSummaryText(hopIndex, nowS) {
+      var stats = statsForHopDisplay(hopIndex, nowS);
+      var seed = state.seedStats[String(hopIndex)] || null;
+      var focusS = currentFocusSeconds();
+      return PURE.buildTargetSummary({
+        target: summaryTargetLabel(hopIndex),
+        source: stats ? stats.source : null,
+        stats: stats ? stats.data : null,
+        seedHasMax: !!(seed && seed.max_ms !== null && seed.max_ms !== undefined &&
+          !isNaN(seed.max_ms)),
+        windowLabel: state.focus ? "Manual" : PURE.focusWindowLabel(state.focusWindowValue),
+        startS: state.focus ? state.focus.startS : nowS - focusS,
+        endS: state.focus ? state.focus.endS : nowS,
+        intervalS: state.intervalS,
+      });
+    }
+
+    // Feedback has its own aria-live line; never the trace status line.
+    function setCopySummaryStatus(text) {
+      if (!isActive() || !els.copySummaryStatus) return;
+      els.copySummaryStatus.textContent = text || "";
+    }
+
+    function copyTargetSummary() {
+      if (!state.sessionId) return;
+      var sid = state.sessionId;
+      var text = targetSummaryText(primaryHopIndex(), effNowS());
+      if (!text) return;
+      PURE.copyPlainText({
+        text: text,
+        clipboard: typeof navigator !== "undefined" ? navigator.clipboard : null,
+        doc: document,
+      }).then(function (ok) {
+        // A tab switch/reset mid-write must not label another trace's toolbar.
+        if (!isActive() || state.sessionId !== sid) return;
+        setCopySummaryStatus(ok ? "Copied" : "Copy failed");
+      });
+    }
+
     function exportSamples() {
       // Plain anchor download — no fetch+blob. The browser follows the
       // server's ``Content-Disposition: attachment`` and writes the file
@@ -4890,6 +5093,8 @@
       // Sync toolbar + main content from this tab's buffers. Called by
       // tabManager.setActive whenever this tab becomes active.
       populateToolbar();
+      // Copy-summary feedback belongs to the trace that produced it.
+      if (els.copySummaryStatus) els.copySummaryStatus.textContent = "";
       // Re-derive the toolbar status from current facts (a background tab's
       // facts may have changed via buffered snapshots/events) and write the
       // DOM now that this tab is active.
@@ -5003,6 +5208,7 @@
     self.toggleBackground = function () { toggleBackground(); };
     self.reset = function () { resetTrace(); };
     self.exportSamples = function () { exportSamples(); };
+    self.copySummary = function () { copyTargetSummary(); };
     self.applyFocusWindowValue = function (v) { applyFocusWindowChange(v); };
     self.toggleHopTimeline = function (hopIndex) { toggleHopTimeline(hopIndex); };
     self.clearFocus = function () { clearFocus(); };
@@ -5062,6 +5268,8 @@
       renderFooterStatus();
       renderFocusCaption();
       if (state.sessionId) renderTimelines();
+      // The rolling window slides on the tick without a table repaint.
+      refreshCopySummaryButton();
     };
     self.handleResize = function () {
       if (!isActive()) return;
@@ -5114,6 +5322,13 @@
       els.exportBtn.addEventListener("click", function () {
         var a = tabManager.getActive();
         if (a) a.exportSamples();
+      });
+    }
+
+    if (els.copySummary) {
+      els.copySummary.addEventListener("click", function () {
+        var a = tabManager.getActive();
+        if (a) a.copySummary();
       });
     }
 

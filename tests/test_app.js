@@ -2561,3 +2561,406 @@ assert.strictEqual(PURE.throughputFetchOnActivate(null), false);
 assert.strictEqual(PURE.throughputFetchOnActivate({}), false);
 
 console.log("app.js assertions passed");
+
+// ------------------------------------------------ Copy summary (PURE)
+// The copied text describes the ACTIVE trace's TARGET only: window bounds in
+// explicit UTC, probe interval, target avg/min/max RTT and packet loss. It
+// reuses the table's stats for the selected window (manual drag-focus wins
+// over the rolling Focus dropdown; a paused trace copies the frozen window).
+
+// UTC stamps are timezone-independent and label the zone explicitly.
+assert.strictEqual(
+  PURE.formatUtcStamp(Date.UTC(2026, 5, 10, 17, 36, 23) / 1000),
+  "2026-06-10 17:36:23 UTC"
+);
+assert.strictEqual(PURE.formatUtcStamp(NaN), "—");
+
+// Ordinary mixed success/loss target window: exact line-for-line text.
+{
+  const summary = PURE.buildTargetSummary({
+    target: "example.com",
+    source: "live",
+    stats: { count: 4, avg: 20, min: 10, max: 30, cur: 30, lossPct: 25 },
+    windowLabel: "Auto",
+    startS: Date.UTC(2026, 5, 10, 17, 36, 23) / 1000,
+    endS: Date.UTC(2026, 5, 10, 17, 46, 23) / 1000,
+    intervalS: 2.5,
+  });
+  assert.strictEqual(
+    summary,
+    [
+      "netplot trace summary",
+      "Target: example.com",
+      "Window: Auto, 2026-06-10 17:36:23 UTC - 2026-06-10 17:46:23 UTC",
+      "Probe interval: 2.5 s",
+      "RTT avg/min/max (ms): 20.0 / 10.0 / 30.0",
+      "Packet loss: 25.0% (lost 1 of 4 probes)",
+    ].join("\n")
+  );
+}
+
+// Empty data (no probes / idle / reset) has nothing to copy.
+assert.strictEqual(
+  PURE.buildTargetSummary({ stats: { count: 0, avg: null, min: null, max: null, lossPct: 0 } }),
+  null
+);
+assert.strictEqual(PURE.buildTargetSummary({}), null);
+assert.strictEqual(PURE.buildTargetSummary(null), null);
+
+// All-loss window: latencies are unavailable, loss counts stay exact.
+{
+  const allLoss = PURE.buildTargetSummary({
+    target: "down.example",
+    source: "live",
+    stats: { count: 3, avg: null, min: null, max: null, cur: null, lossPct: 100 },
+    windowLabel: "1 minute",
+    startS: 940,
+    endS: 1000,
+    intervalS: 1,
+  });
+  assert.ok(allLoss.includes("RTT avg/min/max (ms): n/a / n/a / n/a"));
+  assert.ok(allLoss.includes("Packet loss: 100.0% (lost 3 of 3 probes)"));
+  assert.ok(allLoss.includes("Probe interval: 1 s"));
+}
+
+// A blended ratio whose lost count is not an integer is never rounded into a
+// fabricated integer.
+{
+  const blended = PURE.buildTargetSummary({
+    target: "x",
+    source: "combined",
+    seedHasMax: true,
+    stats: { count: 3, avg: 10, min: 10, max: 10, lossPct: 33.34 },
+    windowLabel: "Auto",
+    startS: 940,
+    endS: 1000,
+    intervalS: 2.5,
+  });
+  assert.ok(blended.includes("Packet loss: 33.3% (3 probes)"));
+  assert.ok(!blended.includes("lost "));
+}
+
+// Unknown probe interval is reported as unavailable, not guessed.
+assert.ok(
+  PURE.buildTargetSummary({
+    stats: { count: 1, avg: 1, min: 1, max: 1, lossPct: 0 },
+  }).includes("Probe interval: n/a")
+);
+
+// Enable predicate: needs a session AND usable target stats.
+assert.strictEqual(PURE.summaryEnabled({ sessionId: "s1", stats: { count: 2 } }), true);
+assert.strictEqual(PURE.summaryEnabled({ sessionId: "s1", stats: { count: 0 } }), false);
+assert.strictEqual(PURE.summaryEnabled({ sessionId: "s1", stats: null }), false);
+assert.strictEqual(PURE.summaryEnabled({ sessionId: null, stats: { count: 2 } }), false);
+assert.strictEqual(PURE.summaryEnabled(null), false);
+
+// A manual drag-focus window overrides the rolling Focus-dropdown window.
+{
+  const s = state();
+  PURE.pushSample(s, 0, 940, 10);
+  PURE.pushSample(s, 0, 990, 20);
+  PURE.pushSample(s, 0, 999, 30);
+  const rolling = PURE.displayStatsForHop(s, 0, 1000, 60);
+  assert.strictEqual(rolling.source, "live");
+  assert.strictEqual(rolling.data.count, 3);
+  s.focus = { startS: 930, endS: 995 };
+  const manual = PURE.displayStatsForHop(s, 0, 1000, 60);
+  assert.strictEqual(manual.source, "focus");
+  assert.strictEqual(manual.data.count, 2);
+  assert.strictEqual(manual.data.avg, 15);
+  // A manual window with no samples is no data (button stays disabled).
+  s.focus = { startS: 100, endS: 200 };
+  assert.strictEqual(PURE.displayStatsForHop(s, 0, 1000, 60), null);
+}
+
+// Paused traces copy the FROZEN window: the rolling cutoff follows the pause
+// instant, not wall time (which would have slid past the samples).
+{
+  const s = state();
+  PURE.pushSample(s, 0, 970, 42);
+  // Wall time is 4000s past the pause instant -> the unfrozen window is empty.
+  assert.strictEqual(PURE.displayStatsForHop(s, 0, 5000, 60), null);
+  const frozenNow = PURE.effectiveNowS(5000, 1000);
+  assert.strictEqual(frozenNow, 1000);
+  const stats = PURE.displayStatsForHop(s, 0, frozenNow, 60);
+  assert.strictEqual(stats.data.count, 1);
+  assert.strictEqual(stats.data.avg, 42);
+  const text = PURE.buildTargetSummary({
+    target: "t",
+    source: stats.source,
+    stats: stats.data,
+    windowLabel: "Auto",
+    startS: frozenNow - 60,
+    endS: frozenNow,
+    intervalS: 2.5,
+  });
+  assert.ok(text.includes(" - " + PURE.formatUtcStamp(1000)));
+}
+
+// Destination stream selection: the final hop when it reaches the target,
+// hop 0 (the separate target stream) otherwise — never blindly one of them.
+{
+  const hops = [
+    { index: 0, ip: "10.0.0.1" },
+    { index: 3, ip: "203.0.113.9" },
+  ];
+  assert.strictEqual(PURE.primaryHopIndex(hops, "203.0.113.9", "ready"), 3);
+  assert.strictEqual(PURE.primaryHopIndex(hops, "198.51.100.7", "ready"), 0);
+
+  const s = state();
+  [10, 10].forEach(function (v, i) { PURE.pushSample(s, 0, 990 + i, v); });
+  [70, 70].forEach(function (v, i) { PURE.pushSample(s, 3, 990 + i, v); });
+  function summaryFor(hopIndex) {
+    const stats = PURE.displayStatsForHop(s, hopIndex, 1000, 60);
+    return PURE.buildTargetSummary({
+      target: "203.0.113.9",
+      source: stats.source,
+      stats: stats.data,
+      windowLabel: "Auto",
+      startS: 940,
+      endS: 1000,
+      intervalS: 2.5,
+    });
+  }
+  assert.ok(
+    summaryFor(PURE.primaryHopIndex(hops, "203.0.113.9", "ready")).includes(
+      "RTT avg/min/max (ms): 70.0 / 70.0 / 70.0"
+    )
+  );
+  assert.ok(
+    summaryFor(PURE.primaryHopIndex(hops, "198.51.100.7", "ready")).includes(
+      "RTT avg/min/max (ms): 10.0 / 10.0 / 10.0"
+    )
+  );
+}
+
+// Snapshot baselines historically ship without max_ms: the combined stat's max
+// is then live-delta-only, so the summary reports it unavailable (with a note)
+// instead of presenting it as a full-window maximum.
+{
+  const s = state();
+  s.seedStats["0"] = { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 };
+  s.seedUntil["0"] = 2000;
+  PURE.pushSample(s, 0, 995, 40);
+  PURE.pushSample(s, 0, 998, 45);
+  let stats = PURE.displayStatsForHop(s, 0, 1000, 60);
+  assert.strictEqual(stats.source, "combined");
+  assert.strictEqual(stats.data.max, 45); // the table's merged value
+  const base = {
+    target: "t",
+    source: stats.source,
+    stats: stats.data,
+    windowLabel: "Auto",
+    startS: 940,
+    endS: 1000,
+    intervalS: 2.5,
+  };
+  const noSeedMax = PURE.buildTargetSummary(
+    Object.assign({}, base, { seedHasMax: false })
+  );
+  assert.ok(/^RTT avg\/min\/max \(ms\): [\d.]+ \/ [\d.]+ \/ n\/a$/m.test(noSeedMax));
+  assert.ok(noSeedMax.includes("Note: max unavailable"));
+
+  // A baseline that does carry a max yields a real full-window maximum.
+  s.seedStats["0"].max_ms = 50;
+  stats = PURE.displayStatsForHop(s, 0, 1000, 60);
+  const withSeedMax = PURE.buildTargetSummary({
+    target: "t",
+    source: stats.source,
+    stats: stats.data,
+    seedHasMax: true,
+    windowLabel: "Auto",
+    startS: 940,
+    endS: 1000,
+    intervalS: 2.5,
+  });
+  assert.ok(/^RTT avg\/min\/max \(ms\): [\d.]+ \/ [\d.]+ \/ 50\.0$/m.test(withSeedMax));
+  assert.ok(!withSeedMax.includes("max unavailable"));
+}
+
+// Masked target: the Mask internal DNS toggle applies to copied text too.
+{
+  assert.strictEqual(
+    PURE.summaryTargetLabel({ dns: "nas.local", ip: "192.168.1.5" }, true, true, ["nas.local"]),
+    "Internal host"
+  );
+  assert.strictEqual(
+    PURE.summaryTargetLabel({ dns: "nas.local", ip: "192.168.1.5" }, true, false, ["nas.local"]),
+    "nas.local"
+  );
+  // External host with masking on is unchanged.
+  assert.strictEqual(
+    PURE.summaryTargetLabel({ dns: "example.com", ip: "203.0.113.9" }, false, true, []),
+    "example.com"
+  );
+  // IP literals are never masked.
+  assert.strictEqual(
+    PURE.summaryTargetLabel({ ip: "192.168.1.5" }, true, true, ["nas.local"]),
+    "192.168.1.5"
+  );
+  assert.strictEqual(PURE.summaryTargetLabel(null, false, false, []), "unknown");
+
+  const maskedText = PURE.buildTargetSummary({
+    target: PURE.summaryTargetLabel({ dns: "nas.local", ip: "192.168.1.5" }, true, true, ["nas.local"]),
+    source: "live",
+    stats: { count: 1, avg: 1, min: 1, max: 1, lossPct: 0 },
+    windowLabel: "Auto",
+    startS: 999,
+    endS: 1000,
+    intervalS: 1,
+  });
+  assert.ok(maskedText.includes("Target: Internal host"));
+  assert.ok(!maskedText.includes("nas.local"));
+}
+
+// Availability follows the SELECTED window end-to-end, not just the sample
+// buffer: samples in the rolling window enable the button, a drag-focus over
+// an empty stretch disables it, clearing focus re-enables it, and a window
+// that slides past the samples disables it again.
+{
+  const s = state();
+  PURE.pushSample(s, 0, 995, 20);
+  function available(nowS, focusS) {
+    const stats = PURE.displayStatsForHop(s, 0, nowS, focusS);
+    return PURE.summaryEnabled({ sessionId: "s1", stats: stats ? stats.data : null });
+  }
+  assert.strictEqual(available(1000, 60), true);
+  s.focus = { startS: 100, endS: 200 };
+  assert.strictEqual(available(1000, 60), false);
+  s.focus = null;
+  assert.strictEqual(available(1000, 60), true);
+  assert.strictEqual(available(2000, 60), false);
+}
+
+// -------------------------------------- Copy summary: toolbar/UI wiring
+// The button state must follow the selected window, not only SSE rounds: a
+// drag-focus or Focus-dropdown change repaints the table, and the rolling
+// window slides on the 1s tick without a repaint. The tab closures are not
+// exported, so guard the call sites in the source.
+{
+  const fs = require("fs");
+  const path = require("path");
+  const staticDir = path.join(__dirname, "..", "src", "netplot", "static");
+  const src = fs.readFileSync(path.join(staticDir, "app.js"), "utf8");
+  function body(startMarker, endMarker) {
+    const from = src.indexOf(startMarker);
+    const to = src.indexOf(endMarker, from);
+    assert.ok(from >= 0 && to > from, "source slice found: " + startMarker);
+    return src.slice(from, to);
+  }
+  // Table repaints: drag-focus, Focus dropdown, snapshot, SSE round, hydrated
+  // baseline (hydrateHopBaselines repaints via renderTable).
+  assert.ok(
+    body("function renderTable()", "function renderFooterStatus()").includes(
+      "refreshCopySummaryButton()"
+    ),
+    "renderTable refreshes the copy-summary button"
+  );
+  assert.ok(
+    body("self.tick = function ()", "self.handleResize = function ()").includes(
+      "refreshCopySummaryButton()"
+    ),
+    "the rolling-window tick refreshes the copy-summary button"
+  );
+  // The feedback line is visible to sighted users and still announced.
+  const html = fs.readFileSync(path.join(staticDir, "index.html"), "utf8");
+  const idAt = html.indexOf('id="copy-summary-status"');
+  assert.ok(idAt > 0, "copy-summary feedback element exists");
+  const el = html.slice(html.lastIndexOf("<", idAt), html.indexOf(">", idAt) + 1);
+  assert.ok(el.includes('aria-live="polite"'), "feedback stays aria-live");
+  assert.ok(!el.includes("visually-hidden"), "feedback is visible");
+  assert.ok(/class="[^"]*\bstatus\b/.test(el), "feedback reuses the status style");
+}
+
+// ------------------------------------------- Copy summary: clipboard paths
+// Success via the async Clipboard API, fallback to execCommand("copy") on
+// plain-HTTP LAN (or when the API rejects), and honest failure when neither
+// works. The textarea must be cleaned up and focus restored.
+function fakeDoc(execOk) {
+  const doc = {
+    body: {
+      child: null,
+      appendChild(el) { doc.body.child = el; },
+      removeChild(el) { if (doc.body.child === el) doc.body.child = null; },
+    },
+    activeElement: { focused: 0, focus() { this.focused += 1; } },
+    createElement(tag) {
+      return {
+        tagName: tag,
+        value: "",
+        style: {},
+        attrs: {},
+        setAttribute(k, v) { this.attrs[k] = v; },
+        select() { this.selected = true; },
+      };
+    },
+    execCommand(cmd) { doc.command = cmd; return !!execOk; },
+  };
+  return doc;
+}
+
+(async function () {
+  // Clipboard API path (secure context).
+  {
+    let written = null;
+    const ok = await PURE.copyPlainText({
+      text: "hello",
+      clipboard: { writeText(t) { written = t; return Promise.resolve(); } },
+      doc: fakeDoc(true),
+    });
+    assert.strictEqual(ok, true);
+    assert.strictEqual(written, "hello");
+  }
+
+  // Rejecting Clipboard API falls back to execCommand (plain-HTTP LAN).
+  {
+    const doc = fakeDoc(true);
+    const ok = await PURE.copyPlainText({
+      text: "fallback",
+      clipboard: { writeText() { return Promise.reject(new Error("denied")); } },
+      doc,
+    });
+    assert.strictEqual(ok, true);
+    assert.strictEqual(doc.command, "copy");
+    assert.strictEqual(doc.body.child, null); // temporary textarea removed
+    assert.strictEqual(doc.activeElement.focused, 1); // focus restored
+  }
+
+  // No Clipboard API at all: execCommand path only.
+  {
+    const doc = fakeDoc(true);
+    assert.strictEqual(await PURE.copyPlainText({ text: "legacy", clipboard: null, doc }), true);
+    assert.strictEqual(doc.command, "copy");
+    assert.strictEqual(doc.body.child, null);
+  }
+
+  // Neither path works: report failure, not false success.
+  {
+    const doc = fakeDoc(false);
+    const ok = await PURE.copyPlainText({
+      text: "nope",
+      clipboard: { writeText() { return Promise.reject(new Error("denied")); } },
+      doc,
+    });
+    assert.strictEqual(ok, false);
+    assert.strictEqual(doc.body.child, null);
+  }
+
+  // A throwing execCommand (some browsers refuse it) is a failure too.
+  {
+    const doc = {
+      body: { appendChild() {}, removeChild() {} },
+      createElement() { return { setAttribute() {}, style: {}, select() {}, value: "" }; },
+      execCommand() { throw new Error("refused"); },
+    };
+    assert.strictEqual(PURE.execCommandCopy(doc, "t"), false);
+  }
+
+  // No document: nothing is claimed.
+  assert.strictEqual(PURE.execCommandCopy(null, "t"), false);
+
+  console.log("copy-summary clipboard assertions passed");
+})().catch(function (err) {
+  console.error(err);
+  process.exit(1);
+});

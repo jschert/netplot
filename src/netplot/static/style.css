@@ -322,6 +322,12 @@ input#target {
   color: var(--green);
 }
 
+/* Copy-summary feedback sits before the settings button; only the trace
+   status line (.status) pushes itself to the toolbar's right edge. */
+.copy-summary-status {
+  margin-left: 0;
+}
+
 /* ----------------------------------------------------------- tab bar */
 /* PingPlotter-style multi-trace tabs: one tab per live trace, plus a "+"
    button to focus a fresh (unsaved) tab. Active tab highlighted; close ×
