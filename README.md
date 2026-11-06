@@ -69,7 +69,7 @@ CSV export, and Prometheus metrics.
 
 Netplot is PingPlotter-style, not a complete PingPlotter replacement: TCP/UDP
 latency-probe modes, built-in alerts, and `.pp2` compatibility are not implemented.
-There is no built-in user authentication; see [LAN access](#lan-access) before
+There is no built-in user authentication; see [LAN access](#optional-lan-access-explicit) before
 exposing the dashboard beyond localhost.
 
 ## License
