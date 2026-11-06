@@ -12,6 +12,66 @@ CSV export, and Prometheus metrics.
 > access and a credential with `read:packages`. Native installs and local
 > source builds do not require registry access.
 
+## Features
+
+### Live route diagnostics
+
+- **Continuous ICMP monitoring** of a hostname or IP address, with automatic
+  traceroute discovery and reverse-DNS names for discovered hops.
+- **Independent destination and per-hop probing**, so the destination remains
+  visible even when intermediate routers or the end of the discovered route
+  do not answer.
+- **Configurable sampling intervals:** 1, 2.5, 5, 10, 30, or 60 seconds.
+  Overlapping, resource-bounded rounds keep send cadence independent of
+  the reply timeout; see [timing and resource limits](#timing-resource-limits-and-sample-accounting).
+- **Multiple trace tabs**, supporting up to eight server-side traces with
+  independent start, pause, resume, and reset controls, plus recent-target history.
+- **Per-hop statistics:** finalized sample count, IP/DNS, average, minimum,
+  current RTT, and packet-loss percentage. Known intermediate hops that
+  never answer ICMP are identified separately from intermittent loss.
+
+### Timelines and focused investigation
+
+- **Live hop graphs** with a shared latency axis, colored latency zones,
+  min–max ranges, average/current markers, and packet-loss hatching.
+- **Destination and selectable hop timelines**, with step-line latency,
+  loss markers, and independent chart ranges from one minute to 24 hours.
+- **Rolling and drag-selected focus windows** that recalculate the table
+  and timeline statistics for the selected period.
+- **Retained history and reconnect backfill**, using bounded raw samples
+  and one-minute rollups for longer views.
+
+### Exports and integrations
+
+- **CSV export of retained raw history**, including UTC/epoch timestamps,
+  hop identifiers, addresses, DNS names, RTT, and an explicit `packet_lost` flag.
+- **Copy summary** for sharing the destination's statistics from the active
+  focus window as plain text.
+- **Prometheus metrics** for trace state, destination RTT/loss/reachability,
+  and per-hop RTT/loss.
+- **Optional InfluxDB 1.x throughput overlay** showing inbound/outbound
+  interface Mbps alongside the destination timeline. It uses an existing
+  no-authentication counter source; it is not a bandwidth speed test.
+- **HTTP APIs and live server-sent events** for trace control, snapshots,
+  history, settings, and integration with other tools.
+
+### Persistence, privacy, and deployment
+
+- **Persistent background trace definitions** that restore their running
+  or paused state after a server restart. Settings persist too; sample
+  history remains in memory and does not survive a restart.
+- **Configurable internal CIDRs and DNS-name masking** for screenshots.
+  Masking is display-only: IP addresses, API responses, and CSV data are unchanged.
+- **Docker Compose or native Python installation**, with prebuilt images for
+  `linux/amd64` and `linux/arm64`, non-root container execution, and a health endpoint.
+- **Browser request isolation and bounded resource use**, including
+  Host/Origin checks and limits on request bodies, exports, and event streams.
+
+Netplot is PingPlotter-style, not a complete PingPlotter replacement: TCP/UDP
+latency-probe modes, built-in alerts, and `.pp2` compatibility are not implemented.
+There is no built-in user authentication; see [LAN access](#lan-access) before
+exposing the dashboard beyond localhost.
+
 ## License
 
 Copyright (C) 2026 jschert and contributors.
