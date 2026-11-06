@@ -82,10 +82,9 @@ GNU Affero General Public License, **version 3 only**
 implied warranties of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 See [LICENSE](LICENSE) for the complete terms.
 
-This license applies to the current source and the upcoming **0.1.4** release.
+This license applies starting with **0.1.4**.
 Previously published releases through **0.1.3** retain their declared MIT
 license; existing release tags and container images are not relicensed.
-The Quick Start below still installs the published 0.1.3 release.
 
 Distributors must provide corresponding source as required by the license.
 If you modify Netplot and let users interact with it remotely, prominently
@@ -147,12 +146,12 @@ the commands here only use your own local `gh`/`docker` binaries.
 
 ```bash
 mkdir netplot && cd netplot
-curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.3/docker-compose.yml \
+curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.4/docker-compose.yml \
   -o docker-compose.yml
-printf 'NETPLOT_VERSION=0.1.3\n' > .env
+printf 'NETPLOT_VERSION=0.1.4\n' > .env
 ```
 
-The Compose file and image are both pinned to the `v0.1.3` release; `.env`
+The Compose file and image are both pinned to the `v0.1.4` release; `.env`
 keeps the selected image version across later commands. Substitute another
 published stable `vX.Y.Z` tag and matching `X.Y.Z` image version if desired.
 Downloading the Compose file needs no GitHub login; pulling the private
@@ -166,7 +165,7 @@ docker compose up -d
 
 Open **http://127.0.0.1:8000**, enter a target (DNS name or IP), pick an
 interval, and press the green **Play** button. The first start pulls
-`ghcr.io/jschert/netplot:0.1.3` for your host (`linux/amd64` or
+`ghcr.io/jschert/netplot:0.1.4` for your host (`linux/amd64` or
 `linux/arm64`). A `denied`/`not found` error means either your account
 lacks access or the selected tag is unavailable.
 
@@ -177,7 +176,7 @@ in a `.env` file next to it to make them stick:
 
 | Variable                | Default                     | Purpose                                                                   |
 | ----------------------- | --------------------------- | ------------------------------------------------------------------------- |
-| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.3`                                           |
+| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.4`                                           |
 | `NETPLOT_BIND_ADDRESS`  | `127.0.0.1`                 | Host interface the published port binds to                                |
 | `NETPLOT_PORT`          | `8000`                      | Host port                                                                 |
 | `NETPLOT_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1`   | Extra exact Host values to accept, e.g. `netplot.example` (see *LAN access*) |
@@ -185,7 +184,7 @@ in a `.env` file next to it to make them stick:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.3
+NETPLOT_VERSION=0.1.4
 NETPLOT_BIND_ADDRESS=127.0.0.1
 NETPLOT_PORT=8000
 ```
@@ -308,7 +307,7 @@ next to `docker-compose.yml` and they apply on every `docker compose up -d`:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.3
+NETPLOT_VERSION=0.1.4
 NETPLOT_ALLOWED_HOSTS=netplot.example
 FORWARDED_ALLOW_IPS=192.0.2.10
 ```
@@ -346,7 +345,7 @@ docker run -d --name netplot \
   -p 127.0.0.1:8000:8000 \
   -v netplot-data:/data \
   --restart unless-stopped \
-  ghcr.io/jschert/netplot:0.1.3
+  ghcr.io/jschert/netplot:0.1.4
 ```
 
 ## Route-origin caveat (containers)
