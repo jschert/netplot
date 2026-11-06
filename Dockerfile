@@ -37,7 +37,7 @@ WORKDIR /app
 
 # Manifest + lock first: this layer is reused across code-only edits, so
 # the (slow) dep export and wheel build of dependencies caches well.
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src/ ./src/
 
 # Export the pinned runtime dependency set from the frozen lock. We omit
@@ -63,8 +63,8 @@ ARG NETPLOT_SOURCE_URL=https://github.com/jschert/netplot
 LABEL org.opencontainers.image.source="${NETPLOT_SOURCE_URL}" \
       org.opencontainers.image.title="netplot" \
       org.opencontainers.image.description="PingPlotter-style network latency and packet-loss dashboard (FastAPI + ping/traceroute)." \
-      org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.license="MIT"
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.license="AGPL-3.0-only"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

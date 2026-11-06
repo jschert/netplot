@@ -1262,11 +1262,15 @@ at the repo root).
 - **Health**: `HEALTHCHECK` polls `GET /healthz` via the stdlib
   (`urllib.request`) — no `curl` install, keeping the image lean.
 - **OCI labels**: `org.opencontainers.image.title`, `.description`,
-  `.license(s)`, and `.source` (the canonical GitHub repository URL, used
-  for GHCR repository association).
-- **Build inputs**: `pyproject.toml`, `uv.lock`, `README.md`, and `src/`
-  are copied into the build stage. `.dockerignore` excludes tests, docs,
-  screenshots, caches, and the local venv from the build context.
+  `.license(s)` (`AGPL-3.0-only`), and `.source` (the canonical GitHub
+  repository URL, used for GHCR repository association).
+- **License packaging**: the wheel and source distribution include the full
+  `LICENSE` text and declare `AGPL-3.0-only` using SPDX package metadata.
+  This applies starting with 0.1.4; previously published releases through
+  0.1.3 retain their MIT licensing. See the root README's License section.
+- **Build inputs**: `pyproject.toml`, `uv.lock`, `README.md`, `LICENSE`, and
+  `src/` are copied into the build stage. `.dockerignore` excludes tests,
+  docs, screenshots, caches, and the local venv from the build context.
 - **Published images**: ``ghcr.io/jschert/netplot`` is **private** and
   multi-arch (``linux/amd64`` + ``linux/arm64``). Each stable ``vX.Y.Z``
   tag publishes image tag ``X.Y.Z``; ``latest`` is moved only after

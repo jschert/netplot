@@ -12,6 +12,29 @@ CSV export, and Prometheus metrics.
 > access and a credential with `read:packages`. Native installs and local
 > source builds do not require registry access.
 
+## License
+
+Copyright (C) 2026 jschert and contributors.
+
+Netplot is free software: you can redistribute it and/or modify it under the
+GNU Affero General Public License, **version 3 only**
+(`AGPL-3.0-only`). It is distributed WITHOUT ANY WARRANTY, including the
+implied warranties of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See [LICENSE](LICENSE) for the complete terms.
+
+This license applies to the current source and the upcoming **0.1.4** release.
+Previously published releases through **0.1.3** retain their declared MIT
+license; existing release tags and container images are not relicensed.
+The Quick Start below still installs the published 0.1.3 release.
+
+Distributors must provide corresponding source as required by the license.
+If you modify Netplot and let users interact with it remotely, prominently
+offer those users the corresponding source for the version they are using,
+including your modifications. An upstream link alone is not sufficient for
+a modified deployment. Source-sharing does not require a pull request to this
+repository or publication to everyone; see sections 6 and 13 of the license.
+Keep third-party license and copyright notices intact.
+
 ## Quick Start (Docker)
 
 Requirements: Docker (Engine 24+ with the Compose v2 plugin, or Docker
