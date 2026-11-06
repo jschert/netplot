@@ -64,12 +64,12 @@ the commands here only use your own local `gh`/`docker` binaries.
 
 ```bash
 mkdir netplot && cd netplot
-curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.2/docker-compose.yml \
+curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.3/docker-compose.yml \
   -o docker-compose.yml
-printf 'NETPLOT_VERSION=0.1.2\n' > .env
+printf 'NETPLOT_VERSION=0.1.3\n' > .env
 ```
 
-The Compose file and image are both pinned to the `v0.1.2` release; `.env`
+The Compose file and image are both pinned to the `v0.1.3` release; `.env`
 keeps the selected image version across later commands. Substitute another
 published stable `vX.Y.Z` tag and matching `X.Y.Z` image version if desired.
 Downloading the Compose file needs no GitHub login; pulling the private
@@ -83,7 +83,7 @@ docker compose up -d
 
 Open **http://127.0.0.1:8000**, enter a target (DNS name or IP), pick an
 interval, and press the green **Play** button. The first start pulls
-`ghcr.io/jschert/netplot:0.1.2` for your host (`linux/amd64` or
+`ghcr.io/jschert/netplot:0.1.3` for your host (`linux/amd64` or
 `linux/arm64`). A `denied`/`not found` error means either your account
 lacks access or the selected tag is unavailable.
 
@@ -94,7 +94,7 @@ in a `.env` file next to it to make them stick:
 
 | Variable                | Default                     | Purpose                                                                   |
 | ----------------------- | --------------------------- | ------------------------------------------------------------------------- |
-| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.2`                                           |
+| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.3`                                           |
 | `NETPLOT_BIND_ADDRESS`  | `127.0.0.1`                 | Host interface the published port binds to                                |
 | `NETPLOT_PORT`          | `8000`                      | Host port                                                                 |
 | `NETPLOT_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1`   | Extra exact Host values to accept, e.g. `netplot.example` (see *LAN access*) |
@@ -102,7 +102,7 @@ in a `.env` file next to it to make them stick:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.2
+NETPLOT_VERSION=0.1.3
 NETPLOT_BIND_ADDRESS=127.0.0.1
 NETPLOT_PORT=8000
 ```
@@ -225,7 +225,7 @@ next to `docker-compose.yml` and they apply on every `docker compose up -d`:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.2
+NETPLOT_VERSION=0.1.3
 NETPLOT_ALLOWED_HOSTS=netplot.example
 FORWARDED_ALLOW_IPS=192.0.2.10
 ```
@@ -263,7 +263,7 @@ docker run -d --name netplot \
   -p 127.0.0.1:8000:8000 \
   -v netplot-data:/data \
   --restart unless-stopped \
-  ghcr.io/jschert/netplot:0.1.2
+  ghcr.io/jschert/netplot:0.1.3
 ```
 
 ## Route-origin caveat (containers)
@@ -355,7 +355,7 @@ policy, and `netplot-data` volume still come from the base file. A bare
 - `GET /static/app.js`, `GET /static/style.css` serve the dashboard assets.
 - `GET /healthz` returns a simple readiness payload.
 - `POST /api/traces` creates and starts a continuous trace against a target (host or IP); route discovery and concurrent per-hop probing begin automatically. See `docs/spec.md` for the full snapshot/SSE contract.
-- `GET /api/traces/{id}/export?format=csv` downloads the full server-held sample history as a flat CSV table (`timestamp_utc,timestamp_epoch,hop_index,ip,dns,rtt_ms`; empty `rtt_ms` for lost probes). Works while running and while paused; 404 unknown session, 400 unsupported format, **429 with `Retry-After`** when two exports are already in flight (the build runs off the event loop under a per-process concurrency guard). Note: the export returns the FULL retained history (up to 10 000 samples per stream ≈ hours), and the endpoint has no authentication — any party that can reach the dashboard can pull any session's history. The dashboard's **Export** toolbar button (next to Reset) triggers a browser download for the active tab's session, enabled once that session has at least one sample.
+- `GET /api/traces/{id}/export?format=csv` downloads the full server-held sample history as a flat CSV table (`timestamp_utc,timestamp_epoch,hop_index,ip,dns,rtt_ms,packet_lost`; `packet_lost` is `1` for a lost probe and `0` for a reply, with empty `rtt_ms` for losses). Per-hop loss percentage over the retained history is `100 * SUM(packet_lost) / COUNT(*)`, grouping by `hop_index`; it may differ from the dashboard's selected-window PL%. Works while running and while paused; 404 unknown session, 400 unsupported format, **429 with `Retry-After`** when two exports are already in flight (the build runs off the event loop under a per-process concurrency guard). Note: the export returns the FULL retained history (up to 10 000 samples per stream ≈ hours), and the endpoint has no authentication — any party that can reach the dashboard can pull any session's history. The dashboard's **Export** toolbar button (next to Reset) triggers a browser download for the active tab's session, enabled once that session has at least one sample.
 - `GET /api/traces/{id}/history?hop=<index>&start=<epoch_s>&end=<epoch_s>&resolution=<raw|1m|auto>` returns per-stream sample history, clamped to `[start, end]`. `resolution=raw` (default) returns the retained raw samples (`{id, hop, resolution: "raw", earliest_t, samples: [{t, rtt_ms}]}`); `resolution=1m` returns per-minute rollup buckets (`{..., resolution: "1m", earliest_t, buckets: [{t, avg_ms, min_ms, max_ms, count, loss_count}]}`, full-loss buckets carry null avg/min/max, empty buckets are omitted); `resolution=auto` picks raw when the requested window fits raw retention (`SAMPLE_CAP * interval_s`), else 1m — the response carries the actual resolution used. `hop=0` is the target stream; `hop>=1` must match a discovered route hop. `earliest_t` (null when empty) lets the client distinguish "no data" from "older than retention". Works while running and while paused; 400 on malformed params or unsupported `resolution`; 404 on unknown session/hop. The dashboard fetches this on restore/reload/reconnect/range-widen so timelines populate immediately. 1h/3h timeline ranges are served raw; 12h/24h ranges use `resolution=auto` (resolved against raw retention) and are rendered from the bucket tier (Slice D2 — the server-side 1-minute rollup keeps memory bounded independent of probe interval; cap 1440 buckets/stream = 24h).
 - `GET /metrics` exposes a Prometheus exposition endpoint (`text/plain; version=0.0.4`) for scraping by a Prometheus instance. Seven gauge families: `netplot_session_info` (one series per session, carrying a `state` label for alert gating), `netplot_target_rtt_current_ms`/`_avg_ms`/`_loss_pct`/`_up`, and `netplot_hop_rtt_current_ms`/`_loss_pct`. Avg and loss are computed over the last 60 samples per stream; the current-RTT gauge is absent when the last probe was a loss (no stale values). Paused sessions keep emitting last-known values truthfully labeled `state="paused"` — alert rules should gate on it. See `docs/spec.md` "Metrics" for the full series/label contract.
 - `GET /api/settings/internal` / `PUT /api/settings/internal {cidrs: [...]}` manage the internal IP ranges (default RFC1918 + IPv6 ULA; other CIDRs editable, one per line in the settings dialog). Hops and the resolved target are classified server-side with the stdlib `ipaddress` module and annotated on the snapshot (`hops[].internal`, `target_internal`). The dashboard's **Mask internal DNS** toolbar toggle then replaces the DNS names of internal hosts with a neutral alias (`Internal host`) everywhere they are displayed — hop table, timeline labels, tab label/tooltips. The mask is display-only: IP addresses are never masked, and API/CSV payloads keep the real names. Persisted to `<data_dir>/settings.json` (atomic writes).
@@ -369,6 +369,49 @@ Route discovery (`traceroute`), per-hop probing (`ping`), reverse DNS, the
 live hop table API, the live dashboard UI (Slices 4 and 6), the timeline
 graph with range/focus controls (Slice 5), and the PingPlotter-style
 toolbar (Slice 6b) are implemented.
+
+### Timing, resource limits, and sample accounting
+
+Probing follows PingPlotter's timing model: the configured interval spaces
+round SEND deadlines (monotonic-clock driven; the first round launches
+immediately on start/resume) and the 3 s reply timeout is independent of
+it. Rounds overlap, so a hop that holds its full reply window cannot
+stretch the send cadence; a reply arriving after the interval but within
+its reply deadline is recorded as a success, and work still pending is
+never a loss.
+
+Concurrency is bounded per session: at most 45 in-flight `ping` processes
+(each permit held until the subprocess is reaped) and at most 45
+launched-but-uncommitted rounds. A round is admitted whole — when the
+budgets are exhausted the launch opportunity is skipped and the next
+scheduled tick retries: no partial rounds, no catch-up burst after a
+stall, and no fabricated packet-loss samples for probes that were never
+sent (any resulting gap is visible in the actual launch timestamps). 45
+is a netplot safety policy inspired by legacy outstanding-request
+guidance, not a verified current PingPlotter default; with the
+eight-session cap, ping-process concurrency stays bounded at 360,
+excluding route discovery. The ~interval cadence holds while the workload
+fits the budget.
+
+Completed rounds are published complete and in launch order. A slow hop
+can delay initial publication by up to its reply window; after warm-up,
+completed rounds stream at roughly the configured interval while under
+budget. `t` on SSE round events and committed samples is the round's
+launch time, not reply time.
+
+Snapshot payloads carry an explicit coverage contract: `captured_at` is
+the single effective window right edge for the whole payload — frozen at
+`paused_at` while paused, so a paused trace's view and baselines share
+one window edge — and `sample_from_t`/`sample_through_t` bracket the
+exact window behind each stats block (null when empty), per stream. The
+client adopts snapshot aggregates only up to their matching cutoffs and
+backfills windows from the history endpoint, so the hop table, the
+copied summary, and the footer sample count all describe the same
+primary-stream focused statistics. The footer's count is the number of
+committed samples in the active window — not a count of received SSE
+messages. Table Count likewise means finalized samples, not outstanding
+probes: admission-skipped or cancelled rounds add no samples and are
+never counted as loss.
 
 ### Slice 6b toolbar
 

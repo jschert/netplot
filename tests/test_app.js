@@ -4,7 +4,19 @@ const assert = require("assert");
 const PURE = require("../src/netplot/static/app.js");
 
 function state() {
-  return { samples: {}, seedStats: {}, seedUntil: {}, seedWatermark: {} };
+  return {
+    samples: {},
+    seedStats: {},
+    seedCut: {},
+    seedFrom: {},
+    seedCap: {},
+    seedFocus: {},
+    seedWatermark: {},
+    covFrom: {},
+    covInFlight: {},
+    covGen: 0,
+    covConnected: false,
+  };
 }
 
 const now = 1000;
@@ -25,11 +37,21 @@ const now = 1000;
 // No seed and no live samples remains the placeholder path.
 assert.strictEqual(PURE.statsForHop(state(), 2, now), null);
 
-// A live delta still combines with a live snapshot baseline.
+// A live delta still combines with a live snapshot baseline: the baseline is
+// adopted from the server contract fields (captured_at anchor, echoed focus
+// width, sample_through_t cutoff, sample_from_t oldest-sample anchor) and
+// combined ONLY with buffered samples strictly after that cutoff, so the
+// merged snapshot tail in the buffer is never counted twice.
 {
   const s = state();
-  s.seedStats["2"] = { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 10 };
-  s.seedUntil["2"] = now + 600;
+  PURE.adoptSnapshotBaseline(
+    s, "2",
+    { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 10 },
+    now - 300, // captured_at: baseline window still overlaps [now-600, now]
+    994,       // sample_through_t: latest sample in the baseline window
+    now - 400, // sample_from_t: oldest baseline sample inside the window
+    PURE.FOCUS_S
+  );
   PURE.pushSample(s, 2, 995, 30);
   PURE.pushSample(s, 2, 998, 30);
   const result = PURE.statsForHop(s, 2, now);
@@ -39,31 +61,504 @@ assert.strictEqual(PURE.statsForHop(state(), 2, now), null);
   assert.ok(Math.abs(result.data.lossPct - (1 / 12) * 100) < 1e-9);
 }
 
-// Expiry must transition to live stats, not to a null render.
+// Mixed losses across BOTH parts keep the weighted statistics exact: the
+// baseline's aggregate loss ratio and the delta's losses are combined by
+// count, avg/min blend only over successes.
 {
   const s = state();
-  s.seedStats["2"] = { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 };
-  s.seedUntil["2"] = now - 1;
-  PURE.pushSample(s, 2, 995, 30);
-  const result = PURE.statsForHop(s, 2, now);
-  assert.strictEqual(result.source, "live");
-  assert.strictEqual(result.data.count, 1);
+  // Baseline: 10 samples, 20% loss (2 losses), avg 20 over 8 successes.
+  PURE.adoptSnapshotBaseline(
+    s, "1",
+    { count: 10, avg_ms: 20, min_ms: 12, cur_ms: 20, loss_pct: 20 },
+    now - 100, 950, 800, PURE.FOCUS_S
+  );
+  // Delta: 30 (success), 40 (success), loss — strictly after the cutoff.
+  PURE.pushSample(s, 1, 951, 30);
+  PURE.pushSample(s, 1, 952, 40);
+  PURE.pushSample(s, 1, 953, null);
+  const r = PURE.statsForHop(s, 1, now);
+  assert.strictEqual(r.source, "combined");
+  assert.strictEqual(r.data.count, 13);
+  assert.ok(Math.abs(r.data.avg - (8 * 20 + 30 + 40) / 10) < 1e-9);
+  assert.strictEqual(r.data.min, 12);
+  assert.strictEqual(r.data.max, 40);
+  assert.strictEqual(r.data.cur, null); // last sample is a loss
+  assert.ok(Math.abs(r.data.lossPct - (3 / 13) * 100) < 1e-9);
 }
 
-// Watermarks reject only samples represented by the baseline; an empty
-// baseline has no watermark and therefore cannot lose post-request samples.
+// Acceptance repro: a three-sample baseline merged with a 29-unique-sample
+// buffer counts 29, not 32. The buffer carries the baseline's own samples
+// (merged snapshot tail for graphs) plus the post-cutoff live delta; the
+// delta path counts only samples strictly after sample_through_t.
 {
   const s = state();
-  s.seedWatermark["2"] = 100;
+  const baselineSamples = [
+    { t: 970, rtt_ms: 10 },
+    { t: 971, rtt_ms: 11 },
+    { t: 972, rtt_ms: 12 },
+  ];
+  PURE.adoptSnapshotBaseline(
+    s, "0",
+    { count: 3, avg_ms: 11, min_ms: 10, max_ms: 12, cur_ms: 12, loss_pct: 0 },
+    972, 972, 970, PURE.FOCUS_S
+  );
+  // Hydration merges the snapshot tail into the raw buffer (graphs keep it).
+  s.samples["0"] = PURE.mergeSamples(s.samples["0"] || [], baselineSamples, null);
+  // 26 live rounds after the cutoff -> 29 unique samples in the buffer.
+  for (let i = 973; i <= 998; i++) PURE.pushSample(s, 0, i, 20);
+  assert.strictEqual(s.samples["0"].length, 29);
+
+  // Loading path (coverage not yet hydrated): baseline + strict delta.
+  const loading = PURE.statsForHop(s, 0, now);
+  assert.strictEqual(loading.source, "combined");
+  assert.strictEqual(loading.data.count, 29, "29, not 32");
+  assert.ok(Math.abs(loading.data.avg - (3 * 11 + 26 * 20) / 29) < 1e-9);
+
+  // Hydrated path (stats window covered): unique raw samples are the SOLE
+  // source — same count, no second addition of the baseline aggregate.
+  PURE.extendCoverage(s, "0", now - PURE.FOCUS_S);
+  const hydrated = PURE.statsForHop(s, 0, now);
+  assert.strictEqual(hydrated.source, "live");
+  assert.strictEqual(hydrated.data.count, 29);
+  assert.ok(Math.abs(hydrated.data.avg - (3 * 11 + 26 * 20) / 29) < 1e-9);
+  assert.strictEqual(hydrated.data.cur, 20);
+}
+
+// Baseline aging is bounded by the aggregate's OLDEST sample (sample_from_t):
+// a full aggregate is reusable only while its oldest sample is still at/after
+// the selected window start (inclusive boundary), then retired — never reused
+// on mere window overlap, and never anchored to client receipt time.
+{
+  const s = state();
+  PURE.adoptSnapshotBaseline(
+    s, "0",
+    { count: 5, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 },
+    550, // captured_at: baseline window [490, 550]
+    555, // sample_through_t: latest sample in the baseline window
+    541, // sample_from_t: oldest sample — the authoritative aging anchor
+    60
+  );
+  // Strictly after the cutoff, inside the window at now=560.
+  PURE.pushSample(s, 0, 556, 30);
+  const edge = PURE.statsForHopWindow(s, 0, 560, 60);
+  assert.strictEqual(edge.source, "combined");
+  assert.strictEqual(edge.data.count, 6);
+  // At from + focus (601) the oldest sample sits exactly on the window
+  // start: the boundary is INCLUSIVE, the aggregate still fits the window.
+  const boundary = PURE.statsForHopWindow(s, 0, 601, 60);
+  assert.strictEqual(boundary.source, "combined");
+  assert.strictEqual(boundary.data.count, 6);
+  // One second past from + focus the oldest sample has crossed the window
+  // start (mere overlap is not enough): live-only.
+  const aged = PURE.statsForHopWindow(s, 0, 602, 60);
+  assert.strictEqual(aged.source, "live");
+  assert.strictEqual(aged.data.count, 1);
+}
+
+// Repro (baseline overcount): a full aggregate is NOT reusable while its
+// window merely overlaps the selected one. Baseline count 2 (samples at 401
+// and 900) captured at 1000; at now=1002 the window starts at 402, so the
+// t=401 sample has aged out — the aggregate (count 2) must be retired and
+// the raw buffer alone counts 1.
+{
+  const s = state();
+  s.samples["0"] = [
+    { t: 401, rtt_ms: 10 },
+    { t: 900, rtt_ms: 30 },
+  ];
+  PURE.adoptSnapshotBaseline(
+    s, "0",
+    { count: 2, avg_ms: 20, min_ms: 10, cur_ms: 30, loss_pct: 0 },
+    1000, 900, 401, 600
+  );
+  // Boundary: oldest sample exactly on the window start — aggregate exact.
+  const edge = PURE.statsForHopWindow(s, 0, 1001, 600);
+  assert.strictEqual(edge.source, "seed");
+  assert.strictEqual(edge.data.count, 2);
+  // Oldest sample crossed the window start: raw-only, count 1 (was 2).
+  const aged = PURE.statsForHopWindow(s, 0, 1002, 600);
+  assert.strictEqual(aged.source, "live");
+  assert.strictEqual(aged.data.count, 1);
+  assert.strictEqual(aged.data.avg, 30);
+  // The raw buffer is retained for graphs despite the baseline retirement.
+  assert.strictEqual(s.samples["0"].length, 2);
+}
+
+// Focus 0 (single-instant window, if a zero-width Focus ever reaches the
+// client): the baseline is reusable only while its oldest sample IS the
+// instant (nowS <= from + 0), and nothing is invented for later instants.
+{
+  const s = state();
+  PURE.adoptSnapshotBaseline(
+    s, "0",
+    { count: 1, avg_ms: 10, min_ms: 10, cur_ms: 10, loss_pct: 0 },
+    500, 500, 500, 0
+  );
+  const at = PURE.statsForHopWindow(s, 0, 500, 0);
+  assert.strictEqual(at.source, "seed");
+  assert.strictEqual(at.data.count, 1);
+  // The instant passed: no coverage, no valid baseline — no invented stats.
+  assert.strictEqual(PURE.statsForHopWindow(s, 0, 501, 0), null);
+}
+
+// A baseline fetched for a different window width is suspended on focus
+// changes until the refetched snapshot for the new window is adopted.
+{
+  const s = state();
+  PURE.adoptSnapshotBaseline(
+    s, "0",
+    { count: 50, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 },
+    now - 100, 995, 800, 600
+  );
+  PURE.pushSample(s, 0, 996, 25);
+  // Same width: combined.
+  assert.strictEqual(PURE.statsForHopWindow(s, 0, now, 600).source, "combined");
+  // Narrowed window: seedFocus mismatch suspends the aggregate -> live-only
+  // (10 raw samples in [940,1000]... only 996 exists here -> count 1).
+  const narrowed = PURE.statsForHopWindow(s, 0, now, 60);
+  assert.strictEqual(narrowed.source, "live");
+  assert.strictEqual(narrowed.data.count, 1);
+}
+
+// Snapshot focus_s echo: preserved EXACTLY, including the HTTP-only
+// all-retained 0 (the Focus dropdown offers no zero option, but snapshot
+// requests do). A missing or malformed echo is rejected outright — never
+// substituted with the selected window — so no mislabeled aggregate can
+// masquerade as a baseline for the selected 60/600 window.
+{
+  const s = state();
+  assert.strictEqual(PURE.snapshotFocusSeconds({ focus_s: 0 }), 0);
+  assert.strictEqual(PURE.snapshotFocusSeconds({ focus_s: 600 }), 600);
+  // All-retained echo (focus_s 0): adopted under its own width…
+  PURE.adoptSnapshotBaseline(
+    s, "0",
+    { count: 50, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 },
+    995, 995, 10, 0
+  );
+  assert.strictEqual(s.seedFocus["0"], 0);
+  // …and it never masquerades as the selected positive window: suspended
+  // for both 60 and 600 (empty raw buffer -> null; the aggregate is NOT
+  // reinterpreted as all-history coverage of the selected window).
+  assert.strictEqual(PURE.statsForHopWindow(s, 0, now, 600), null,
+    "all-retained baseline cannot serve the 600 window");
+  assert.strictEqual(PURE.statsForHopWindow(s, 0, now, 60), null,
+    "all-retained baseline cannot serve the 60 window");
+  // Within its own width it stays exact: the single-instant window admits
+  // the baseline only while its oldest sample IS the instant (10 <= 10+0),
+  // and nothing is invented once the instant has passed.
+  assert.strictEqual(PURE.statsForHopWindow(s, 0, 10, 0).source, "seed");
+  assert.strictEqual(PURE.statsForHopWindow(s, 0, 10, 0).data.count, 50);
+  assert.strictEqual(PURE.statsForHopWindow(s, 0, 11, 0), null);
+
+  // Missing/malformed echoes: null, never the currently selected width.
+  assert.strictEqual(PURE.snapshotFocusSeconds({}), null);
+  assert.strictEqual(PURE.snapshotFocusSeconds({ focus_s: "60" }), null);
+  assert.strictEqual(PURE.snapshotFocusSeconds({ focus_s: -60 }), null);
+  assert.strictEqual(PURE.snapshotFocusSeconds({ focus_s: NaN }), null);
+  assert.strictEqual(PURE.snapshotFocusSeconds({ focus_s: Infinity }), null);
+  assert.strictEqual(PURE.snapshotFocusSeconds(null), null);
+
+  // …and adoption rejects them wholesale: no baseline and no tombstone may
+  // be written under an unknown window width (empty payloads included).
+  const r = state();
+  assert.strictEqual(PURE.adoptSnapshotBaseline(
+    r, "7",
+    { count: 5, avg_ms: 1, min_ms: 1, cur_ms: 1, loss_pct: 0 },
+    900, 900, 850, undefined
+  ), false, "missing echo rejected");
+  assert.strictEqual(PURE.adoptSnapshotBaseline(
+    r, "7", { count: 0, avg_ms: null, min_ms: null, cur_ms: null, loss_pct: 0 },
+    901, null, null, null
+  ), false, "empty payload with unknown width rejected");
+  assert.strictEqual(r.seedStats["7"], undefined);
+  assert.strictEqual(r.seedCap["7"], undefined);
+  assert.strictEqual(r.seedFocus["7"], undefined);
+
+  // A truthful 60-wide echo is stored as 60 and serves only the 60 window —
+  // never the 600 window (suspended until the 600 snapshot lands).
+  const m = state();
+  PURE.adoptSnapshotBaseline(
+    m, "0",
+    { count: 50, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 },
+    995, 995, 941, 60
+  );
+  assert.strictEqual(m.seedFocus["0"], 60);
+  assert.strictEqual(PURE.statsForHopWindow(m, 0, now, 600), null,
+    "60-wide baseline cannot serve the 600 window");
+}
+
+// Watermarks reject only samples represented by the baseline: the cutoff is
+// the payload's sample_through_t, and an empty baseline has no watermark so
+// post-request SSE samples are never discarded.
+{
+  const s = state();
+  PURE.adoptSnapshotBaseline(
+    s, "2",
+    { count: 2, avg_ms: 10, min_ms: 10, cur_ms: 10, loss_pct: 0 },
+    now - 100, 100, 100, PURE.FOCUS_S
+  );
   PURE.pushSample(s, 2, 100, 10);
   PURE.pushSample(s, 2, 101, 11);
   assert.deepStrictEqual(s.samples["2"], [{ t: 101, rtt_ms: 11 }]);
 }
 
-// The same rule applies to the top-level snapshot path: receipt time is not
-// a valid substitute watermark for an empty payload.
-assert.strictEqual(PURE.snapshotWatermark([]), undefined);
-assert.strictEqual(PURE.snapshotWatermark([{ t: 100 }, { t: 101 }]), 101);
+// Snapshot adoption guards: monotonic in captured_at, explicit empty-stream
+// handling, and rejection of payloads without a capture anchor.
+{
+  // An OLDER snapshot arriving after a newer adoption is rejected wholesale:
+  // the newer baseline survives and the live sample pushed past its cutoff
+  // is preserved.
+  const s = state();
+  const newer = { count: 20, avg_ms: 15, min_ms: 5, cur_ms: 15, loss_pct: 0 };
+  assert.strictEqual(
+    PURE.adoptSnapshotBaseline(s, "3", newer, 900, 899, 850, 60), true
+  );
+  PURE.pushSample(s, 3, 900, 42); // live sample after the newer cutoff
+  assert.strictEqual(
+    PURE.adoptSnapshotBaseline(
+      s, "3", { count: 5, avg_ms: 99, min_ms: 1, cur_ms: 99, loss_pct: 0 },
+      850, 849, 800, 60
+    ),
+    false,
+    "older captured_at rejected"
+  );
+  assert.strictEqual(s.seedStats["3"], newer);
+  assert.strictEqual(s.seedCut["3"], 899);
+  assert.deepStrictEqual(s.samples["3"], [{ t: 900, rtt_ms: 42 }]);
+
+  // Equal captured_at adopts (paused snapshots and same-instant top-level /
+  // per-hop fetches are all captured at the frozen anchor).
+  const same = { count: 21, avg_ms: 16, min_ms: 5, cur_ms: 16, loss_pct: 0 };
+  assert.strictEqual(PURE.adoptSnapshotBaseline(s, "3", same, 900, 900, 850, 60), true);
+  assert.strictEqual(s.seedStats["3"], same);
+  assert.strictEqual(s.seedCut["3"], 900);
+
+  // A REPEATED (identical) snapshot is idempotent: re-adoption replaces the
+  // baseline rather than accumulating it, so counts stay stable.
+  const repeat = state();
+  const payload = { count: 3, avg_ms: 25, min_ms: 25, cur_ms: 25, loss_pct: 0 };
+  PURE.adoptSnapshotBaseline(repeat, "0", payload, 972, 972, 970, PURE.FOCUS_S);
+  repeat.samples["0"] = PURE.mergeSamples(repeat.samples["0"] || [], [
+    { t: 970, rtt_ms: 25 }, { t: 971, rtt_ms: 25 }, { t: 972, rtt_ms: 25 },
+  ], null);
+  for (let i = 973; i <= 998; i++) PURE.pushSample(repeat, 0, i, 25);
+  const first = PURE.statsForHop(repeat, 0, now);
+  assert.strictEqual(PURE.adoptSnapshotBaseline(repeat, "0", payload, 972, 972, 970, PURE.FOCUS_S), true);
+  const second = PURE.statsForHop(repeat, 0, now);
+  assert.strictEqual(second.source, first.source);
+  assert.strictEqual(second.data.count, first.data.count);
+  assert.strictEqual(first.data.count, 29, "baseline + 26 delta, stable across re-adoption");
+
+  // An EMPTY snapshot clears the stream's baseline, cutoff, aging anchor,
+  // and watermark outright instead of leaving the previous aggregate stale
+  // — while PRESERVING the latest capture marker.
+  assert.strictEqual(PURE.adoptSnapshotBaseline(s, "3", same, 901, null, null, 60), true);
+  assert.strictEqual(s.seedStats["3"], undefined);
+  assert.strictEqual(s.seedCut["3"], undefined);
+  assert.strictEqual(s.seedCap["3"], 901);
+  assert.strictEqual(s.seedWatermark["3"], undefined);
+  // ...and a count-0 payload behaves identically.
+  assert.strictEqual(
+    PURE.adoptSnapshotBaseline(
+      s, "3", { count: 0, avg_ms: null, min_ms: null, cur_ms: null, loss_pct: 0 },
+      902, 902, null, 60
+    ),
+    true
+  );
+  assert.strictEqual(s.seedStats["3"], undefined);
+  assert.strictEqual(s.seedCap["3"], 902);
+
+  // A newer EMPTY snapshot preserves the capture marker, so an OLDER
+  // nonempty snapshot arriving later is rejected instead of resurrecting a
+  // stale aggregate behind the cleared baseline (the old code deleted the
+  // marker with the baseline and re-adopted the older payload).
+  assert.strictEqual(
+    PURE.adoptSnapshotBaseline(
+      s, "3", { count: 4, avg_ms: 50, min_ms: 5, cur_ms: 50, loss_pct: 0 },
+      1010, null, null, 600
+    ),
+    true
+  );
+  assert.strictEqual(s.seedStats["3"], undefined);
+  assert.strictEqual(
+    PURE.adoptSnapshotBaseline(
+      s, "3", { count: 4, avg_ms: 50, min_ms: 5, cur_ms: 50, loss_pct: 0 },
+      1000, 999, 400, 600
+    ),
+    false,
+    "older nonempty payload rejected behind cleared baseline"
+  );
+  assert.strictEqual(s.seedStats["3"], undefined);
+  assert.strictEqual(s.seedCut["3"], undefined);
+  assert.strictEqual(s.seedCap["3"], 1010);
+  // Equal frozen paused captures still adopt after a clear.
+  assert.strictEqual(
+    PURE.adoptSnapshotBaseline(
+      s, "3", { count: 4, avg_ms: 50, min_ms: 5, cur_ms: 50, loss_pct: 0 },
+      1010, 1009, 500, 600
+    ),
+    true
+  );
+  assert.strictEqual(s.seedStats["3"].count, 4);
+
+  // A payload without captured_at is never adopted: baseline aging must not
+  // fall back to client receipt time or the latest local sample.
+  assert.strictEqual(
+    PURE.adoptSnapshotBaseline(
+      s, "4", { count: 5, avg_ms: 1, min_ms: 1, cur_ms: 1, loss_pct: 0 },
+      undefined, 900, 850, 60
+    ),
+    false
+  );
+  assert.strictEqual(s.seedStats["4"], undefined);
+
+  // A nonempty payload without sample_from_t is rejected outright: aging is
+  // bounded by the oldest sample, and inventing it client-side (e.g. from
+  // the theoretical window start) would silently fabricate coverage the
+  // server never reported.
+  assert.strictEqual(
+    PURE.adoptSnapshotBaseline(
+      s, "5", { count: 5, avg_ms: 1, min_ms: 1, cur_ms: 1, loss_pct: 0 },
+      900, 900, undefined, 60
+    ),
+    false
+  );
+  assert.strictEqual(s.seedStats["5"], undefined);
+  // No baseline, no coverage: nothing is invented for the window.
+  assert.strictEqual(PURE.statsForHopWindow(s, 5, 1000, 60), null);
+}
+
+// Coverage adoption: min of adopted window starts; a hydrated window makes
+// the raw buffer the sole source even while a baseline is still valid, and
+// a hydrated-but-empty window truthfully reports zero.
+{
+  const s = state();
+  assert.strictEqual(PURE.extendCoverage(s, "0", 500), 500);
+  assert.strictEqual(PURE.extendCoverage(s, "0", 700), 500, "coverage only extends earlier");
+  assert.strictEqual(PURE.extendCoverage(s, "0", 300), 300);
+
+  const s2 = state();
+  PURE.adoptSnapshotBaseline(
+    s2, "0",
+    { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 },
+    995, 995, 941, 60
+  );
+  s2.samples["0"] = [{ t: 995, rtt_ms: 20 }];
+  PURE.pushSample(s2, 0, 996, 30);
+  // Without coverage: combined (11).
+  assert.strictEqual(PURE.statsForHopWindow(s2, 0, now, 60).data.count, 11);
+  // Coverage complete: raw-only (2 unique samples), even though the
+  // baseline is still valid.
+  PURE.extendCoverage(s2, "0", now - 60);
+  const raw = PURE.statsForHopWindow(s2, 0, now, 60);
+  assert.strictEqual(raw.source, "live");
+  assert.strictEqual(raw.data.count, 2);
+
+  // Hydrated but empty: the zero count is truthful (a stale aggregate is
+  // never shown for a covered window).
+  const s3 = state();
+  PURE.adoptSnapshotBaseline(
+    s3, "0",
+    { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 },
+    400, 400, 341, 60
+  );
+  PURE.extendCoverage(s3, "0", 940);
+  const empty = PURE.statsForHopWindow(s3, 0, 1000, 60);
+  assert.strictEqual(empty.source, "live");
+  assert.strictEqual(empty.data.count, 0);
+}
+
+// Coverage in-flight OWNERSHIP: the marker carries the owning request's
+// token, so a stale completion (an old focus/reset generation whose marker
+// was replaced by a newer backfill, or wiped by a reconnect) releases
+// nothing — it can never clear a newer request's in-flight flag and unlock
+// a duplicate backfill while the current one is still outstanding.
+{
+  const s = state();
+  s.covInFlight["3"] = 12; // newer generation's backfill owns the marker
+  assert.strictEqual(PURE.releaseCoverageInFlight(s, "3", 4), false,
+    "stale token cannot release");
+  assert.strictEqual(s.covInFlight["3"], 12, "newer request still outstanding");
+  assert.strictEqual(PURE.releaseCoverageInFlight(s, "3", 12), true, "owner releases");
+  assert.strictEqual(s.covInFlight["3"], false);
+  assert.strictEqual(PURE.releaseCoverageInFlight(s, "3", 12), false,
+    "release is one-shot");
+  // Unknown stream / wiped map (reconnect, reset): nothing to release.
+  assert.strictEqual(PURE.releaseCoverageInFlight(state(), "3", 12), false);
+}
+
+// Coverage CONTINUITY generation (transport break/reconnect fencing): a
+// trusted claim is invalidated the moment the SSE transport breaks, a
+// pre-break history completion cannot restore it, and only a completion
+// from the current connection generation can. The break also wipes the old
+// requests' ownership tokens, so their late completions release nothing and
+// can never clear a newer request's in-flight marker.
+{
+  const s = state();
+  s.covGen = 3;
+  assert.strictEqual(PURE.extendCoverageIfCurrent(s, "0", 940, 3, s.covGen), undefined,
+    "a backfill before initial SSE ready cannot establish coverage");
+  s.covConnected = true;
+  PURE.adoptSnapshotBaseline(
+    s, "0",
+    { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 },
+    995, 995, 941, 60
+  );
+  s.samples["0"] = [{ t: 995, rtt_ms: 20 }];
+  PURE.pushSample(s, 0, 996, 30);
+
+  // Trusted: a current-generation completion establishes coverage and the
+  // raw buffer becomes the sole statistics source (2 unique samples).
+  assert.strictEqual(PURE.extendCoverageIfCurrent(s, "0", 940, 3, s.covGen), 940);
+  const trusted = PURE.statsForHopWindow(s, 0, now, 60);
+  assert.strictEqual(trusted.source, "live");
+  assert.strictEqual(trusted.data.count, 2);
+
+  // Transport break: claims invalidated IMMEDIATELY (accounting falls back
+  // to the baseline-combined loading path — the outage may already be
+  // dropping samples) and the continuity generation advances.
+  assert.strictEqual(PURE.breakCoverageContinuity(s), 4);
+  assert.strictEqual(s.covFrom["0"], undefined);
+  assert.strictEqual(s.covInFlight["0"], undefined);
+  assert.strictEqual(s.covConnected, false);
+  const afterBreak = PURE.statsForHopWindow(s, 0, now, 60);
+  assert.strictEqual(afterBreak.source, "combined");
+  assert.strictEqual(afterBreak.data.count, 11);
+
+  // A pre-break history completion cannot restore coverage: its fetched
+  // window cannot span the outage gap, so the claim is refused and
+  // accounting stays on the baseline path.
+  assert.strictEqual(PURE.extendCoverageIfCurrent(s, "0", 940, 3, s.covGen), undefined,
+    "stale-generation completion cannot restore coverage");
+  assert.strictEqual(PURE.statsForHopWindow(s, 0, now, 60).source, "combined");
+  // A focus-triggered request can start after error and capture the current
+  // generation. It still cannot prove continuity while SSE is disconnected.
+  assert.strictEqual(PURE.extendCoverageIfCurrent(s, "0", 940, 4, s.covGen), undefined,
+    "an outage-era current-generation completion cannot claim coverage");
+  assert.strictEqual(s.covFrom["0"], undefined);
+
+  // Reconnect advances the generation again, fencing requests issued during
+  // the outage (they captured the break generation and their windows still
+  // cannot span the reconnect gap).
+  assert.strictEqual(PURE.breakCoverageContinuity(s), 5);
+  assert.strictEqual(PURE.extendCoverageIfCurrent(s, "0", 940, 4, s.covGen), undefined,
+    "outage-era completion cannot claim across the gap");
+  s.covConnected = true; // the current EventSource delivered ready
+  // The current generation's completion CAN re-establish coverage.
+  assert.strictEqual(PURE.extendCoverageIfCurrent(s, "0", 940, 5, s.covGen), 940);
+  const restored = PURE.statsForHopWindow(s, 0, now, 60);
+  assert.strictEqual(restored.source, "live");
+  assert.strictEqual(restored.data.count, 2);
+
+  // Ownership: the break wiped the pre-break marker; its late completion
+  // releases nothing and cannot clobber the current backfill's marker.
+  assert.strictEqual(PURE.breakCoverageContinuity(s), 6);
+  s.covInFlight["0"] = 21; // current-generation backfill owns the stream
+  assert.strictEqual(PURE.releaseCoverageInFlight(s, "0", 7), false,
+    "pre-break token releases nothing");
+  assert.strictEqual(s.covInFlight["0"], 21, "current request still owns the stream");
+  assert.strictEqual(PURE.releaseCoverageInFlight(s, "0", 21), true, "owner releases");
+}
 
 // Focus expiry uses the same 605-second retention boundary as pushSample.
 {
@@ -498,8 +993,11 @@ assert.strictEqual(PURE.LEGEND_FLOOR_MS, 300);
 {
   // Live max > seed max_ms (snapshot shipped one) -> live wins.
   const s1 = state();
-  s1.seedStats["2"] = { count: 10, avg_ms: 20, min_ms: 10, max_ms: 25, cur_ms: 20, loss_pct: 0 };
-  s1.seedUntil["2"] = now + 600;
+  PURE.adoptSnapshotBaseline(
+    s1, "2",
+    { count: 10, avg_ms: 20, min_ms: 10, max_ms: 25, cur_ms: 20, loss_pct: 0 },
+    now - 300, 994, now - 400, PURE.FOCUS_S
+  );
   PURE.pushSample(s1, 2, 995, 30);
   PURE.pushSample(s1, 2, 998, 40);
   const r1 = PURE.statsForHop(s1, 2, now);
@@ -508,8 +1006,11 @@ assert.strictEqual(PURE.LEGEND_FLOOR_MS, 300);
 
   // Seed max_ms > live max -> seed wins.
   const s2 = state();
-  s2.seedStats["2"] = { count: 10, avg_ms: 20, min_ms: 10, max_ms: 90, cur_ms: 20, loss_pct: 0 };
-  s2.seedUntil["2"] = now + 600;
+  PURE.adoptSnapshotBaseline(
+    s2, "2",
+    { count: 10, avg_ms: 20, min_ms: 10, max_ms: 90, cur_ms: 20, loss_pct: 0 },
+    now - 300, 994, now - 400, PURE.FOCUS_S
+  );
   PURE.pushSample(s2, 2, 995, 30);
   PURE.pushSample(s2, 2, 998, 40);
   const r2 = PURE.statsForHop(s2, 2, now);
@@ -518,8 +1019,11 @@ assert.strictEqual(PURE.LEGEND_FLOOR_MS, 300);
   // No max_ms in seed (current backend shape) -> live max; non-null when live
   // has successful samples.
   const s3 = state();
-  s3.seedStats["2"] = { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 };
-  s3.seedUntil["2"] = now + 600;
+  PURE.adoptSnapshotBaseline(
+    s3, "2",
+    { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 },
+    now - 300, 994, now - 400, PURE.FOCUS_S
+  );
   PURE.pushSample(s3, 2, 995, 30);
   PURE.pushSample(s3, 2, 998, 40);
   const r3 = PURE.statsForHop(s3, 2, now);
@@ -621,36 +1125,6 @@ assert.strictEqual(PURE.LEGEND_FLOOR_MS, 300);
   assert.strictEqual(PURE.connectorPoint(null, 300, 120), null);
 }
 
-// Status-dot CSS class names: renderRow emits "status-dot status-<kind>".
-// style.css MUST define matching standalone class selectors (the post-6a
-// defect was a compound selector vs the emitted standalone class). Cross-check
-// by parsing the stylesheet text.
-{
-  const fs = require("fs");
-  const path = require("path");
-  const css = fs.readFileSync(
-    path.join(__dirname, "..", "src", "netplot", "static", "style.css"),
-    "utf8"
-  );
-  // Strip CSS comments so explanatory text (which may reference the old
-  // selector names) does not produce false matches.
-  const cssNoComments = css.replace(/\/\*[\s\S]*?\*\//g, "");
-  // The emitted class strings.
-  const emitted = ["status-green", "status-red", "status-hollow"];
-  for (const cls of emitted) {
-    // Match ".status-green" as a selector (word boundary so it does not
-    // accidentally match a substring of another selector).
-    const re = new RegExp("\\." + cls + "\\b");
-    assert.ok(re.test(cssNoComments), "style.css defines a ." + cls + " rule");
-  }
-  // The old non-matching compound selectors must be gone.
-  for (const kind of ["green", "red", "hollow"]) {
-    assert.ok(
-      !new RegExp("\\.status-dot\\." + kind).test(cssNoComments),
-      "legacy compound selector removed: " + kind
-    );
-  }
-}
 
 // ----------------------------------------------------------- Slice 6b PURE
 // (toolbar controls: target history, focus-window mapping, caption
@@ -761,20 +1235,32 @@ assert.strictEqual(PURE.LEGEND_FLOOR_MS, 300);
   assert.strictEqual(PURE.formatFocusCaption(null, null, null), "Focus: —");
 }
 
-// snapshotExpiry = last sample t + focusS; varies with the focus window
-// (the Slice 6b requirement that seed-baseline expiry follows the Focus
-// dropdown). Undefined for an empty snapshot.
+// Baseline validity is window-matched (the Slice 6b replacement for
+// seed-expiry-follows-the-dropdown): each Focus selection refetches the
+// snapshot for that width, the echoed focus_s rides the adoption, and an
+// aggregate computed for one width never combines into another width.
 {
-  const samples = [{ t: 100 }, { t: 200 }, { t: 350 }];
-  assert.strictEqual(PURE.snapshotExpiry(samples, 600), 350 + 600);
-  assert.strictEqual(PURE.snapshotExpiry(samples, 60), 350 + 60);
-  assert.strictEqual(PURE.snapshotExpiry(samples, 300), 350 + 300);
-  // Empty / missing samples -> undefined (caller falls back to receipt time).
-  assert.strictEqual(PURE.snapshotExpiry([], 600), undefined);
-  assert.strictEqual(PURE.snapshotExpiry(null, 600), undefined);
-  // Non-positive focusS falls back to FOCUS_S.
-  assert.strictEqual(PURE.snapshotExpiry(samples, 0), 350 + PURE.FOCUS_S);
-  assert.strictEqual(PURE.snapshotExpiry(samples, -10), 350 + PURE.FOCUS_S);
+  const cap = now - 100;
+  function adoptWith(focusS) {
+    const s = state();
+    PURE.adoptSnapshotBaseline(
+      s, "0",
+      { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 },
+      cap, cap + 1, cap - 50, focusS
+    );
+    return s;
+  }
+  // Matching width: baseline participates (seed-only, nothing after cutoff).
+  assert.strictEqual(
+    PURE.statsForHopWindow(adoptWith(600), 0, now, 600).source, "seed"
+  );
+  // Mismatched width: aggregate suspended -> no stats path invents one.
+  assert.strictEqual(
+    PURE.statsForHopWindow(adoptWith(600), 0, now, 60), null
+  );
+  assert.strictEqual(
+    PURE.statsForHopWindow(adoptWith(60), 0, now, 600), null
+  );
 }
 
 // computeStatsWindow matches computeStats when passed FOCUS_S, and produces
@@ -803,13 +1289,18 @@ assert.strictEqual(PURE.LEGEND_FLOOR_MS, 300);
 
 // statsForHopWindow matches statsForHop when passed FOCUS_S, and produces
 // narrower counts under a smaller window (the seed-baseline combination
-// path is parameterised end-to-end).
+// path is parameterised end-to-end; each width uses its own snapshot
+// baseline, adopted with the echoed focus_s).
 {
-  // Seed within 600s; samples spanning [now-200, now-5] so the 60s window
-  // excludes the older samples but the 600s window includes all of them.
+  // Two per-width baselines over the same stream (as two snapshot fetches
+  // with different Focus widths would produce); samples spanning
+  // [now-200, now-5] so the 60s window excludes the older live samples.
   const s = state();
-  s.seedStats["2"] = { count: 50, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 };
-  s.seedUntil["2"] = now + 600;
+  PURE.adoptSnapshotBaseline(
+    s, "2",
+    { count: 50, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 },
+    now - 200, now - 370, now - 500, 600
+  );
   // 10 samples inside the last ~25s; 10 samples between 100s and 370s ago.
   for (let i = 0; i < 10; i++) PURE.pushSample(s, 2, now - (5 + i * 2), 25);
   for (let i = 0; i < 10; i++) PURE.pushSample(s, 2, now - (100 + i * 30), 30);
@@ -818,13 +1309,20 @@ assert.strictEqual(PURE.LEGEND_FLOOR_MS, 300);
   assert.strictEqual(def.source, same.source);
   assert.strictEqual(def.data.count, same.data.count);
 
-  // The 60s window should yield a smaller combined count than the 600s one
-  // because the older live samples are excluded while the seed baseline
-  // (50) remains the same.
-  const w60 = PURE.statsForHopWindow(s, 2, now, 60);
+  // 600s window: baseline (50) + the nineteen post-cutoff samples (ten
+  // recent, nine of the older batch — the oldest sits exactly on the
+  // cutoff and is excluded) -> combined.
   const w600 = PURE.statsForHopWindow(s, 2, now, 600);
+  assert.strictEqual(w600.source, "combined");
+  assert.strictEqual(w600.data.count, 69);
+  assert.ok(w600.data.count > 50, "seed baseline still combined with live");
+
+  // 60s window: the width-600 baseline is suspended (window mismatch), so
+  // the count comes from the raw buffer alone — the ten recent samples.
+  const w60 = PURE.statsForHopWindow(s, 2, now, 60);
+  assert.strictEqual(w60.source, "live");
+  assert.strictEqual(w60.data.count, 10);
   assert.ok(w60.data.count < w600.data.count, "narrower window -> smaller count");
-  assert.ok(w60.data.count > 50, "seed baseline still combined with live");
 }
 
 // FOCUS_OPTIONS exposes the four dropdown choices for documentation/
@@ -2739,8 +3237,11 @@ assert.strictEqual(PURE.summaryEnabled(null), false);
 // instead of presenting it as a full-window maximum.
 {
   const s = state();
-  s.seedStats["0"] = { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 };
-  s.seedUntil["0"] = 2000;
+  PURE.adoptSnapshotBaseline(
+    s, "0",
+    { count: 10, avg_ms: 20, min_ms: 10, cur_ms: 20, loss_pct: 0 },
+    990, 990, 941, 60
+  );
   PURE.pushSample(s, 0, 995, 40);
   PURE.pushSample(s, 0, 998, 45);
   let stats = PURE.displayStatsForHop(s, 0, 1000, 60);
@@ -2832,45 +3333,50 @@ assert.strictEqual(PURE.summaryEnabled(null), false);
   assert.strictEqual(available(2000, 60), false);
 }
 
-// -------------------------------------- Copy summary: toolbar/UI wiring
-// The button state must follow the selected window, not only SSE rounds: a
-// drag-focus or Focus-dropdown change repaints the table, and the rolling
-// window slides on the 1s tick without a repaint. The tab closures are not
-// exported, so guard the call sites in the source.
+// ---------------------------------------------- Footer source (primary facts)
+// The footer's sample count comes from the SAME stats object the table and
+// copied summary use for the primary stream (never an SSE message counter,
+// which reconnect/history restoration would give a different meaning), and
+// its last-sample time comes from the primary stream's raw buffer so a
+// restored tab shows the existing history's recency instead of a blank.
 {
-  const fs = require("fs");
-  const path = require("path");
-  const staticDir = path.join(__dirname, "..", "src", "netplot", "static");
-  const src = fs.readFileSync(path.join(staticDir, "app.js"), "utf8");
-  function body(startMarker, endMarker) {
-    const from = src.indexOf(startMarker);
-    const to = src.indexOf(endMarker, from);
-    assert.ok(from >= 0 && to > from, "source slice found: " + startMarker);
-    return src.slice(from, to);
-  }
-  // Table repaints: drag-focus, Focus dropdown, snapshot, SSE round, hydrated
-  // baseline (hydrateHopBaselines repaints via renderTable).
-  assert.ok(
-    body("function renderTable()", "function renderFooterStatus()").includes(
-      "refreshCopySummaryButton()"
-    ),
-    "renderTable refreshes the copy-summary button"
+  const s = state();
+  // Primary stream: hop 3 with a baseline + live delta; hop 0 also present
+  // but NOT primary (route ready, final hop reaches the target).
+  PURE.adoptSnapshotBaseline(
+    s, "3",
+    { count: 7, avg_ms: 30, min_ms: 20, cur_ms: 30, loss_pct: 0 },
+    990, 990, 941, 60
   );
-  assert.ok(
-    body("self.tick = function ()", "self.handleResize = function ()").includes(
-      "refreshCopySummaryButton()"
-    ),
-    "the rolling-window tick refreshes the copy-summary button"
-  );
-  // The feedback line is visible to sighted users and still announced.
-  const html = fs.readFileSync(path.join(staticDir, "index.html"), "utf8");
-  const idAt = html.indexOf('id="copy-summary-status"');
-  assert.ok(idAt > 0, "copy-summary feedback element exists");
-  const el = html.slice(html.lastIndexOf("<", idAt), html.indexOf(">", idAt) + 1);
-  assert.ok(el.includes('aria-live="polite"'), "feedback stays aria-live");
-  assert.ok(!el.includes("visually-hidden"), "feedback is visible");
-  assert.ok(/class="[^"]*\bstatus\b/.test(el), "feedback reuses the status style");
+  [0, 3].forEach(function (hop) {
+    PURE.pushSample(s, hop, 991, hop === 3 ? 35 : 10);
+    PURE.pushSample(s, hop, 999, hop === 3 ? 40 : 11);
+  });
+  const facts = PURE.primaryStreamFacts(s, PURE.primaryHopIndex(
+    [{ index: 3, ip: "203.0.113.9" }], "203.0.113.9", "ready"
+  ), 1000, 60);
+  // Count equals the table's stats for that hop (combined 7 + 2).
+  assert.strictEqual(facts.stats.count, 9);
+  assert.strictEqual(facts.stats.cur, 40);
+  // Last-sample time is the primary stream's own newest buffered sample.
+  assert.strictEqual(facts.lastT, 999);
+  // Same query the table would issue for hop 0 stays hop-0-scoped.
+  const hop0 = PURE.primaryStreamFacts(s, 0, 1000, 60);
+  assert.strictEqual(hop0.lastT, 999);
+  assert.strictEqual(hop0.stats.count, 2);
+
+  // Empty buffer / no stats: nulls, not fabricated values.
+  const empty = PURE.primaryStreamFacts(state(), 0, 1000, 60);
+  assert.strictEqual(empty.stats, null);
+  assert.strictEqual(empty.lastT, null);
+  // A restored tab with ONLY history in the buffer still reports recency.
+  const restored = state();
+  restored.samples["5"] = [{ t: 900, rtt_ms: 8 }, { t: 905, rtt_ms: 9 }];
+  const r5 = PURE.primaryStreamFacts(restored, 5, 950, 60);
+  assert.strictEqual(r5.stats.count, 2, "raw-only stats over the window");
+  assert.strictEqual(r5.lastT, 905);
 }
+
 
 // ------------------------------------------- Copy summary: clipboard paths
 // Success via the async Clipboard API, fallback to execCommand("copy") on

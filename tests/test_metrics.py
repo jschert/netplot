@@ -14,6 +14,10 @@ Covers (acceptance criteria from the slice spec):
 6. Paused label — series present with ``state="paused"``.
 7. Escaping — backslash, double-quote, and newline in label values.
 8. HTTP — 200, correct Content-Type, empty-state behaviour.
+9. Ordered commit — with the overlapping scheduler holding round 1 while
+   later rounds finish first, capture/render describe exactly the
+   committed launch-ordered rounds (nothing for pending rounds, nothing
+   added by canceled rounds after a pause).
 
 The pure formatter (:func:`render_metrics`) is exercised directly with
 hand-built :class:`SessionMetrics` so value/escaping logic is pinned
@@ -23,6 +27,7 @@ through ``TestClient`` with injected sample data.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
 import time
@@ -763,3 +768,71 @@ def test_metrics_endpoint_label_escaping_via_unsafe_target(tmp_path) -> None:
 def test_metrics_window_constant_is_60() -> None:
     """Pin the window constant; the spec says it is not configurable."""
     assert METRICS_WINDOW_SAMPLES == 60
+
+
+# ------------------------------- capture vs the ordered-commit boundary
+#
+# The overlapping scheduler commits completed rounds in launch order, and a
+# completed round parks uncommitted behind an earlier one. The regression
+# reuses the ordered-commit scenario driver from test_rollup (held round 1
+# with RTTs 30.0/loss/10.0 in rounds 1-3, later rounds blocked forever, then
+# pause) and asserts the capture/render side of the same boundary: the
+# window describes exactly the committed samples — before the held round
+# commits, after the ordered commits, and after the pause that cancels the
+# blocked rounds (which must not turn skipped/canceled work into losses).
+
+
+def test_capture_describes_exactly_committed_rounds_across_overlap_and_pause() -> None:
+    from test_rollup import _OVERLAP_TARGET, _drive_ordered_commit_scenario
+
+    obs = asyncio.run(_drive_ordered_commit_scenario())
+    session = obs["session"]
+
+    # Before the held round commits, rounds that already finished probing
+    # are NOT in the window: no pending/provisional values, no series.
+    mid = obs["mid"]["metrics"]
+    assert len(mid) == 1
+    assert mid[0].target_stream is None
+    assert mid[0].hops == []
+
+    # After the ordered commits the window is exactly (30.0, None, 10.0):
+    # current 10.0 (last COMMITTED round, not the newest reply), avg 20.0
+    # over the two successes, loss 1/3, up 1.
+    committed = obs["committed_metrics"]
+    assert len(committed) == 1
+    ts = committed[0].target_stream
+    assert ts is not None
+    assert ts.current_ms == 10.0
+    assert ts.avg_ms == pytest.approx(20.0)
+    assert ts.loss_pct == pytest.approx(100.0 / 3.0)
+    assert ts.up == 1
+    # Destination/final-hop alias: one hop series over the shared stream.
+    assert [(h.hop_index, h.current_ms) for h in committed[0].hops] == [(1, 10.0)]
+    assert committed[0].hops[0].loss_pct == pytest.approx(100.0 / 3.0)
+
+    # Pausing with blocked later rounds outstanding flips the state label,
+    # not the values: canceled uncommitted rounds are not losses.
+    paused = obs["paused_metrics"]
+    assert session.state == "paused"
+    assert paused[0].state == "paused"
+    assert paused[0].target_stream == ts
+    assert paused[0].hops == committed[0].hops
+
+    # The rendered exposition carries the committed values only.
+    parsed = parse_prom(render_metrics(paused))
+    base = {"session_id": session.id, "target": _OVERLAP_TARGET}
+    assert (
+        _one(parsed["samples"], "netplot_target_rtt_current_ms", base)["value"] == 10.0
+    )
+    assert _one(parsed["samples"], "netplot_target_rtt_avg_ms", base)["value"] == (
+        pytest.approx(20.0)
+    )
+    assert _one(parsed["samples"], "netplot_target_loss_pct", base)["value"] == (
+        pytest.approx(100.0 / 3.0)
+    )
+    assert _one(parsed["samples"], "netplot_target_up", base)["value"] == 1.0
+    hop = {**base, "hop": "1"}
+    assert _one(parsed["samples"], "netplot_hop_rtt_current_ms", hop)["value"] == 10.0
+    assert _one(parsed["samples"], "netplot_hop_loss_pct", hop)["value"] == (
+        pytest.approx(100.0 / 3.0)
+    )

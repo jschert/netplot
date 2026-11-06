@@ -10,7 +10,9 @@ Source: PingPlotter manuals and product docs researched 2026-07-28
 ## Product model (what we are recreating)
 
 PingPlotter's probe model: TTL-limited probes map the route (hop 1, hop 2,
-...), and every hop is probed continuously at the trace interval. Each
+...), and every hop is probed continuously at the trace interval (in
+netplot this cadence is conditional on bounded per-session resources —
+see Concurrency). Each
 polling round is a "sample set". Intermediate hops answer ICMP Time
 Exceeded and may drop/deprioritize those responses, so per-hop loss does
 NOT imply end-to-end loss; the final target's stats are the trusted result.
@@ -21,9 +23,13 @@ NOT imply end-to-end loss; the final target's stats are the trusted result.
 2. Route is discovered; hop rows appear as hops respond. Silent hops stay
    visible as `*` / unknown — the route is never collapsed.
 3. Live per-hop table: **Hop, Count, IP, DNS, Avg, Min, Cur, PL%**.
-   - Count = packets sent in the focus period.
-   - Avg excludes lost samples. Cur = most recent RTT, `ERR` if lost.
-   - PL% = lost / sent for that hop in the focus period.
+   - Count = finalized samples in the focus period, not pending probes.
+     A round skipped because the resource budget was full adds no sample
+     and is never counted as loss (see Concurrency). Unknown-address hops
+     retain their existing per-round no-reply placeholder samples.
+   - Avg excludes lost samples. Cur = most recent committed RTT, `ERR`
+     if lost.
+   - PL% = lost / finalized samples for that hop in the focus period.
 4. Per-hop latency visualization: a PingPlotter-faithful graph column (see
    the Frontend section for the full anatomy).
 5. Target timeline graph: black RTT line over time, red vertical marks on
@@ -154,11 +160,22 @@ values with a logged reason rather than crashing restore.
 
 ### Defaults adopted
 
-- Reply timeout: 3 s (PingPlotter default).
+- Reply timeout: 3 s (PingPlotter default). The reply timeout is
+  INDEPENDENT of the send interval: round launches follow monotonic
+  interval deadlines, so a hop that holds its full reply window cannot
+  stretch the send cadence, and a reply arriving after the interval but
+  within its reply deadline is recorded as a success. Only a probe still
+  pending at its reply deadline becomes a loss; work that was never sent
+  (admission-skipped) or cancelled before commit produces no sample at
+  all.
 - Probe packet size: 56 bytes (PingPlotter default) — only relevant if raw
   ICMP is adopted; subprocess ping uses the OS default.
 - Interval: user-set, floor 1 s. Research found no authoritative shipped
-  default; UI default is 2.5 s (PingPlotter's familiar feel), min 1.
+  default; UI default is 2.5 s (PingPlotter's familiar feel), min 1. The
+  interval spaces send deadlines, not round durations — rounds overlap
+  subject to the bounded budgets described under Concurrency, and the
+  ~interval cadence holds only while the workload fits the budget (as in
+  PingPlotter).
 - Focus window: default = last 10 minutes of samples ("Auto" semantics).
   `?focus=<seconds>` on the snapshot API; `focus=0` = all samples.
 - Timeline + graph-column thresholds: green ≤ 100 ms, yellow 101–200 ms,
@@ -209,8 +226,51 @@ Closing a tab (DELETE) frees a slot for the next create.
 
 ### Concurrency
 
-asyncio throughout: one scheduler task per session firing probe rounds at
-the configured interval; within a round all hop probes run concurrently.
+asyncio throughout: one scheduler task per session launches probe rounds
+from monotonic interval deadlines, and within a round all hop probes run
+concurrently. Rounds OVERLAP — the scheduler does not wait for a round to
+finish before launching the next — so a hop holding its full 3 s reply
+window cannot delay the next send.
+
+- **Send cadence.** The first round launches immediately on start/resume,
+  then one launch opportunity per ``interval_s`` deadline. Missed
+  deadlines (an event-loop stall) never produce catch-up bursts: the
+  deadline advances along its interval grid past ``now``, so at most one
+  round launches per tick.
+- **Resource budgets (per session).** ``MAX_OUTSTANDING_PROBES = 45``
+  bounds concurrently in-flight ``ping`` processes; a permit is held from
+  round launch until the engine's subprocess work — spawn, reply wait,
+  kill, and reap — completes, so the budget counts real processes.
+  ``MAX_PENDING_ROUNDS = 45`` bounds launched-but-uncommitted rounds,
+  including finished rounds waiting behind an earlier one for ordered
+  commit. 45 is a netplot safety policy inspired by the legacy Pingman
+  outstanding-request guidance (its documented 45-request default is from
+  an older version, not a verified current PingPlotter limit); with the
+  eight-session cap, total ping-process concurrency stays bounded at 360,
+  excluding route discovery.
+- **Whole-round admission.** A launch opportunity is taken only when its
+  complete known-host probe plan fits the remaining process budget AND
+  the pending-round count is below the cap. Otherwise the opportunity is
+  omitted and the next scheduled tick retries: no partial rounds, no
+  unbounded waiting queue, and no fabricated loss samples for probes
+  that were never sent. Actual launch timestamps expose any resulting
+  gap; an all-timeout trace with more known hosts than the budget can
+  legitimately fall below the ~interval cadence.
+- **Ordered commit.** Each round captures an immutable plan at launch
+  (launch-order sequence, epoch launch timestamp, hop identities,
+  destination streams); sample ``t`` is the round launch time. Completed
+  rounds commit strictly in launch order — raw deque append, rollup fold,
+  and SSE publication are one atomic step per round — so history,
+  rollups, and the event feed stay duplicate-free even when a later
+  round finishes first, and route discovery completing mid-flight cannot
+  mutate an outstanding round or duplicate the target sample.
+- **Lifecycle ownership.** The scheduler owns every round it launches.
+  Pause, delete/reset, shutdown, and restore rollback stop future
+  launches, cancel outstanding collectors and probe tasks, and reap ping
+  children before completing. Committed history is retained; cancelled
+  uncommitted rounds are discarded — no partial writes and no false
+  losses — and resume starts a fresh scheduler generation so no old
+  round can append, aggregate, or publish after it.
 
 ### API (REST + SSE)
 
@@ -226,8 +286,12 @@ the configured interval; within a round all hop probes run concurrently.
   "Persistent (background) collections" section above.
 - `POST /api/traces/{id}/pause`, `POST /api/traces/{id}/resume`
   (pause response/summary carries ``paused_at``: epoch seconds recorded
-  after probe/discovery tasks are cancelled and awaited; cleared on
-  resume/start). For persistent sessions, pause/resume also rewrite the
+  after probe/discovery tasks are cancelled and awaited — including every
+  in-flight round and its ping children, so nothing commits, aggregates,
+  or publishes after the pause completes; committed history is retained
+  and cancelled uncommitted rounds are discarded, not recorded as losses.
+  Cleared on resume/start, which begins a fresh scheduler generation).
+  For persistent sessions, pause/resume also rewrite the
   state file so a restart resumes the session in the same desired state.
   Pausing also interrupts pending forward DNS; cancellation is never treated
   as an ordinary lookup failure. Resuming restarts discovery if pause
@@ -272,14 +336,29 @@ the configured interval; within a round all hop probes run concurrently.
   see the "Settings" section); ``icmp_non_responsive`` is the trace-local
   neutral classification (see the "ICMP non-responsive presentation"
   section).
-  Full and hop-scoped snapshots capture live sample buffers synchronously
-  on the probe event loop, without yielding, so probe writes cannot interleave
-  with deque iteration.
+  **Coverage contract:** every payload is captured atomically on the
+  event loop (a concurrent probe append cannot split stats from their
+  cutoffs) and carries ``captured_at`` — the single effective window
+  right edge for the WHOLE payload: ``paused_at`` (frozen) for a paused
+  session, else the capture-time clock. The same anchor applies to the
+  top-level target stats/samples, every ``hops[]`` entry, and the
+  ``hop=`` single-hop variant. Each stats block is accompanied by
+  ``sample_through_t`` (newest) and ``sample_from_t`` (oldest): the
+  extrema of the exact window that produced those stats, losses
+  included, null when that stream's window is empty. Clients adopt the
+  aggregates only for samples at/below the matching cutoff and backfill
+  the window from the history endpoint (see Frontend), so SSE samples
+  and history merges never double-count against a snapshot baseline.
 - `GET /api/traces/{id}/export?format=csv` → 200 ``text/csv`` with
   ``Content-Disposition: attachment; filename="netplot-<sanitized-target>-<created-utc>.csv"``.
   One flat table, header row
-  ``timestamp_utc,timestamp_epoch,hop_index,ip,dns,rtt_ms``; ``rtt_ms`` is
-  empty for lost probes; ``ip``/``dns`` are empty for silent hops. Commas and
+  ``timestamp_utc,timestamp_epoch,hop_index,ip,dns,rtt_ms,packet_lost``.
+  ``packet_lost`` is ``1`` for a lost probe (``rtt_ms`` is empty) and ``0``
+  for a reply, including a zero-millisecond reply. Per-hop loss percentage
+  is ``100 * SUM(packet_lost) / COUNT(*)``, grouping by ``hop_index`` over
+  the exported rows. This covers the full retained raw history, not the
+  dashboard's selected window, so it can differ from the displayed PL%.
+  ``ip``/``dns`` are empty for silent hops. Commas and
   quotes are CSV-escaped, and formula-leading text in ``ip``/``dns`` is
   prefixed with an apostrophe to prevent spreadsheet formula execution (the
   check strips ANY leading Unicode whitespace/control/format character — BOM,
@@ -480,6 +559,16 @@ the configured interval; within a round all hop probes run concurrently.
     `{"t": …, "results": [{"hop": <index>, "rtt_ms": <float|null>}, …]}`
     where `hop == 0` denotes the target (route pending/failed) and
     `hop >= 1` matches the route event's hop indexes (final hop = target).
+    `t` is the round's epoch LAUNCH time — the same `t` carried by the
+    committed samples — not reply collection time.
+  - **Publication order and latency.** Rounds are published complete and
+    in launch order (a later round that finishes probing first waits for
+    its predecessors to commit). A slow hop can delay initial
+    publication by up to its reply window (3 s default); once the
+    pipeline is warm and the workload stays under the resource budgets,
+    completed rounds stream at roughly the configured interval. Rounds
+    skipped by admission and rounds cancelled by pause/reset/shutdown
+    are never published as loss events.
   - `: keepalive` comments when idle.
 
   **Admission + cleanup:** at most **8 subscribers per session**
@@ -766,6 +855,17 @@ contract for the full bucket math) and a bucket rendering path so 12 h /
   Pausing…/Resuming… > Starting… > error > Reconnecting… > Running >
   Paused > Idle. An unreconciled control error pins until one
   state-bearing snapshot arrives.
+- **Footer status line.** The page footer (``#status-line``) shows
+  ``samples N · elapsed · last round``. ``N`` is the committed sample
+  count of the PRIMARY stream (the focused target/final-hop stream) over
+  the active stats window — the same primary-focused statistics the hop
+  table and the Copy summary show — so it keeps its meaning across
+  reload, reconnect, and history restoration. It is NOT a count of
+  received SSE messages (the former ``roundsReceived`` counter and its
+  resets were removed); intermediate hops can legitimately show fewer
+  samples because discovery finished after destination probing began.
+  ``last round`` is the newest committed sample's launch time from the
+  same authoritative data.
 
 #### Toolbar (Slice 6b — PingPlotter-style controls)
 
@@ -800,8 +900,11 @@ current stats window and its live local-time bounds.
   ``1 minute`` / ``5 minutes`` / ``10 minutes``. The selected window is
   applied to ``PURE.statsForHopWindow`` (Count/Avg/Min/Cur/PL%/graph
   whiskers across all hops including the target row), the snapshot fetch
-  ``?focus=<seconds>`` query, and the seed-baseline expiry
-  (``seedUntil = snapshot's last sample t + focusS``). Changing the
+  ``?focus=<seconds>`` query, and the seed-baseline validity. A loading
+  aggregate is usable only until its oldest included sample
+  (``sample_from_t``) leaves that same-width window. Paused snapshots and
+  the client view share a frozen ``captured_at``/``paused_at`` anchor.
+  Changing the
   dropdown re-fetches the snapshot so the seed baseline matches the new
   window and clears any active manual drag-focus. **Manual drag-focus
   overrides the dropdown**: while a drag-focus is active, the dropdown's
@@ -1018,11 +1121,19 @@ The Slice 5 timeline graph renders one `<canvas>` per open hop:
   (Slice D1: ``MAX_RANGE_S + 5`` = 10 805 s, matching the widened raw
   buffer), it auto-clears.
 
-When a focus window is active, the table computes stats from the live
-client-side sample buffer for that hop filtered to `[start, end]`. The
-seedStats baseline (which has no per-sample timestamps) is bypassed for
-focus analysis. Clearing focus restores the Slice 4 rolling-window
-behavior that combines the snapshot baseline with live samples.
+When a focus window is active, the table computes stats from raw samples
+only. A snapshot aggregate is a LOADING baseline, not an indefinitely
+renewable total: the client adopts it only up to the payload's matching
+cutoff (``captured_at`` / ``sample_through_t``), backfills the selected
+window from ``GET /api/traces/{id}/history``, and — once that window's
+raw coverage is complete — uses the unique raw samples as the sole
+statistics source. An old aggregate can therefore never be added on top
+of a different window (the historical 29-unique-samples-shown-as-32
+double counting is impossible). Clearing focus restores the
+rolling-window view under the same cutoff rules: baseline data at/below
+its cutoff plus live samples strictly after it, with stale or
+out-of-order snapshot/history responses guarded by request generation so
+a late older snapshot never overwrites newer evidence.
 
 ### Internal-host DNS masking (screenshot mode)
 
@@ -1383,3 +1494,34 @@ at the repo root).
   the primary timeline overlays it behind a per-tab checkbox on a separate
   labeled Mbps axis with two direction lines (breaking at gaps), never
   disturbing the existing latency/loss/focus behaviour.
+- **Slice F (done):** PingPlotter timing parity and sample accounting.
+  Send cadence is decoupled from the 3 s reply timeout: rounds launch
+  from monotonic interval deadlines and overlap, replacing the old
+  wait-for-completion loop, with no catch-up bursts after missed
+  deadlines. Admission is bounded per session (``MAX_OUTSTANDING_PROBES
+  = 45`` ping processes held from launch through reap,
+  ``MAX_PENDING_ROUNDS = 45`` launched-but-uncommitted rounds — a
+  netplot safety policy inspired by the legacy Pingman outstanding-request
+  guidance, not a verified current PingPlotter default; 8 sessions →
+  360 process ceiling excluding route discovery); a launch opportunity
+  whose whole probe plan does not fit is skipped until the next tick —
+  no partial rounds, no fabricated loss for unsent or cancelled probes.
+  Completed rounds commit strictly in launch order (raw append + rollup
+  fold + SSE publish as one atomic step per round), so SSE publication
+  can delay initial publication by up to the reply window and then
+  streams at roughly the configured interval under budget; ``t`` on
+  round events and samples is the launch time. Snapshots carry an
+  explicit coverage contract captured atomically on the event loop —
+  ``captured_at`` (single effective window right edge, frozen at
+  ``paused_at`` while paused, identical for the top-level target, every
+  ``hops[]`` entry, and ``hop=`` payloads) plus per-stream
+  ``sample_from_t``/``sample_through_t`` extrema of the exact stats
+  window (null when empty). The client adopts baselines only up to their
+  cutoffs, backfills coverage-aware raw stats from the history endpoint,
+  and sources table, copied summary, and footer sample count from the
+  same primary-stream focused statistics; the SSE-message
+  ``roundsReceived`` footer counter was removed. Pause/delete/shutdown
+  await round and subprocess cleanup; committed history is retained and
+  cancelled uncommitted rounds are discarded (never false losses).
+  Existing URLs, SSE round shape, CSV columns (``packet_lost`` included),
+  persistence format, and retention caps are unchanged.

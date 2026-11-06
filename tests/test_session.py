@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import time
 
 import pytest
@@ -118,8 +119,12 @@ def test_stats_focus_zero_means_all() -> None:
 def test_snapshot_caps_returned_samples_at_snAPSHOT_tail() -> None:
     session = _make_session()
     now = time.time()
+    # Timestamps ascend but END at ``now`` — at/before the snapshot's
+    # capture-time anchor regardless of how long this insert loop takes.
     for i in range(SNAPSHOT_TAIL + 50):
-        session.samples.append(Sample(t=now + i * 0.001, rtt_ms=float(i)))
+        session.samples.append(
+            Sample(t=now - (SNAPSHOT_TAIL + 50 - i) * 0.001, rtt_ms=float(i))
+        )
 
     snap = session.snapshot(focus_s=0)
     assert len(snap["samples"]) == SNAPSHOT_TAIL
@@ -131,7 +136,8 @@ def test_snapshot_caps_returned_samples_at_snAPSHOT_tail() -> None:
 
 def test_snapshot_payload_shape() -> None:
     session = _make_session(target="example.com")
-    session.append_sample(1.0, t=time.time())
+    sample_t = time.time()
+    session.append_sample(1.0, t=sample_t)
 
     snap = session.snapshot(focus_s=60.0)
     assert set(snap.keys()) == {
@@ -145,6 +151,9 @@ def test_snapshot_payload_shape() -> None:
         "focus_s",
         "name",
         "persistent",
+        "captured_at",
+        "sample_through_t",
+        "sample_from_t",
         "hops",
         "stats",
         "samples",
@@ -159,6 +168,14 @@ def test_snapshot_payload_shape() -> None:
     assert snap["persistent"] is False
     assert snap["hops"] == []
     assert snap["focus_s"] == 60.0
+    # Snapshot cutoff contract: ``captured_at`` is the single effective
+    # epoch the window was selected against (time.time() while running,
+    # frozen paused_at while paused); ``sample_from_t`` /
+    # ``sample_through_t`` are the extrema of the exact stats window
+    # (equal to the one sample here; null for empty streams).
+    assert isinstance(snap["captured_at"], float)
+    assert snap["sample_from_t"] == pytest.approx(sample_t)
+    assert snap["sample_through_t"] == pytest.approx(sample_t)
     assert set(snap["stats"].keys()) == {
         "count",
         "avg_ms",
@@ -640,8 +657,10 @@ def test_snapshot_hop_returns_recent_samples_for_hop() -> None:
     session = _make_session()
     session.hops = [Hop(index=1, ip="10.0.0.1", dns="router")]
     now = time.time()
+    # Timestamps END at ``now`` — at/before the snapshot anchor (a stamp
+    # past the capture instant would be future-dated and excluded).
     for i in range(3):
-        session.hops[0].samples.append(Sample(t=now + i, rtt_ms=float(i)))
+        session.hops[0].samples.append(Sample(t=now - 2 + i, rtt_ms=float(i)))
 
     payload = session.snapshot_hop(hop_index=1, focus_s=0)
     assert payload is not None
@@ -678,6 +697,41 @@ def test_snapshot_includes_hops_with_stats() -> None:
     assert h1["index"] == 2 and h1["ip"] is None
     # Silent hop's only sample is a loss.
     assert h1["stats"]["count"] == 1 and h1["stats"]["loss_pct"] == pytest.approx(100.0)
+
+
+def test_snapshot_anchor_excludes_future_samples_and_includes_exact_edge() -> None:
+    """A snapshot's captured_at anchor is a hard right edge: samples newer
+    than it reach no stats, cutoff, or sample list, while a sample exactly
+    at the anchor is included. focus=0 keeps every retained sample at/before
+    the anchor — however old — but never the future-dated record. The
+    ordinary (no-explicit-end) focus=0 stats path keeps its all-retained
+    semantics, future record and all."""
+    session = _make_session()
+    anchor = time.time() - 120.0
+    session.state = "paused"  # freeze the capture anchor like a paused trace
+    session.paused_at = anchor
+    session.append_sample(1.0, t=anchor - 300)
+    session.append_sample(2.0, t=anchor - 10)
+    session.append_sample(3.0, t=anchor)  # exact-anchor boundary → in
+    session.append_sample(9.0, t=anchor + 30)  # future-dated → out
+
+    snap = session.snapshot(focus_s=60.0)
+    assert snap["captured_at"] == pytest.approx(anchor)
+    assert snap["stats"]["count"] == 2
+    assert snap["stats"]["cur_ms"] == pytest.approx(3.0)
+    assert snap["sample_through_t"] == pytest.approx(anchor)
+    assert snap["sample_from_t"] == pytest.approx(anchor - 10)
+    assert all(s["t"] <= anchor for s in snap["samples"])
+
+    wide = session.snapshot(focus_s=0)
+    assert wide["stats"]["count"] == 3  # all retained at/before the anchor
+    assert wide["sample_through_t"] == pytest.approx(anchor)
+    assert wide["sample_from_t"] == pytest.approx(anchor - 300)
+    assert all(s["t"] <= anchor for s in wide["samples"])
+
+    # Ordinary stats carry no anchor: focus=0 still counts the whole
+    # retained stream, future-dated record included.
+    assert session.stats(focus_s=0)["count"] == 4
 
 
 # ------------------------------------------- discovery + probe loop wiring
@@ -1169,5 +1223,451 @@ def test_resolve_target_swallows_ordinary_dns_failure_and_discovery_continues() 
             await mgr.delete(session)
         finally:
             loop.getaddrinfo = real_getaddrinfo
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------ overlapping scheduler
+#
+# PingPlotter-parity scheduling regressions: deadline-driven launches with
+# overlapping rounds, launch-ordered exactly-once commit, whole-round
+# admission under the session probe budgets, and lifecycle cleanup that
+# blocks later writes. Fakes keep every scenario deterministic.
+
+
+def test_rounds_overlap_while_earlier_probe_awaits_reply() -> None:
+    """Launches keep firing on the interval while earlier probes are still
+    awaiting replies (interval independent of the 3 s reply window), and a
+    reply arriving long after its interval — but inside its deadline — is
+    committed as a success, not a loss."""
+    launches: list[float] = []
+
+    async def fake_probe(_host, _timeout_s):
+        launches.append(time.monotonic())
+        await asyncio.sleep(0.3)  # 6x the interval, far below the 3 s timeout
+        return 5.0
+
+    async def run():
+        mgr = SessionManager(
+            probe_fn=fake_probe,
+            discover_fn=_failing_discover,
+            resolve_name_fn=_fast_resolve_name,
+            probe_timeout_s=3.0,
+        )
+        session = mgr.create("example.com", interval_s=0.05)
+        await mgr.start(session)
+        await asyncio.sleep(0.5)
+        await mgr.pause(session)
+        # No cancelled round may commit after pause completed.
+        frozen = len(session.samples)
+        await asyncio.sleep(0.4)
+        assert len(session.samples) == frozen
+        return session
+
+    session = asyncio.run(run())
+    # Overlap: several rounds launched while earlier probes were pending.
+    assert len(launches) >= 4
+    # Send cadence follows the interval grid, not the probe duration: a
+    # serialized loop would show ~0.3 s gaps between launches.
+    gaps = [b - a for a, b in itertools.pairwise(launches)]
+    assert gaps
+    assert max(gaps) < 0.25
+    # Late replies are successes; committed rounds land exactly once each.
+    assert len(session.samples) >= 2
+    assert all(s.rtt_ms == pytest.approx(5.0) for s in session.samples)
+    assert session._probe_permits == 0
+    assert session._pending_rounds == 0
+
+
+def test_commit_is_launch_ordered_when_later_round_finishes_first() -> None:
+    """Round 1's reply is slow and round 2 finishes first: history stays
+    launch-ordered, current RTT comes from the newest committed round, the
+    SSE feed mirrors the deque one-to-one, and raw/rollup counts have no
+    duplicates."""
+    replies: list[float] = []
+
+    async def fake_probe(_host, _timeout_s):
+        n = len(replies)
+        value = 11.0 if n == 0 else 22.0
+        replies.append(value)
+        if n == 0:
+            await asyncio.sleep(0.25)  # round 1 finishes last
+        return value
+
+    async def run():
+        mgr = SessionManager(
+            probe_fn=fake_probe,
+            discover_fn=_failing_discover,
+            resolve_name_fn=_fast_resolve_name,
+            probe_timeout_s=3.0,
+        )
+        session = mgr.create("example.com", interval_s=0.05)
+        queue = session.subscribe()
+        await mgr.start(session)
+        await asyncio.sleep(0.5)
+        await mgr.pause(session)
+        events = []
+        while True:
+            try:
+                event = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(event, RoundEvent):
+                events.append(event)
+        return session, events
+
+    session, events = asyncio.run(run())
+    samples = list(session.samples)
+    assert len(samples) >= 2
+    assert len(events) == len(samples), "one SSE round event per committed round"
+    # Launch-ordered history: the slow first round commits first even
+    # though the second round finished probing earlier.
+    assert samples[0].rtt_ms == pytest.approx(11.0)
+    assert samples[1].rtt_ms == pytest.approx(22.0)
+    ts = [s.t for s in samples]
+    assert all(b > a for a, b in itertools.pairwise(ts)), "deque stays launch-ordered"
+    assert [e.t for e in events] == ts, "SSE events mirror committed history"
+    assert samples[-1].rtt_ms == session.stats(0)["cur_ms"], (
+        "current RTT comes from the newest committed round"
+    )
+    # Exactly-once: the rollup folded each sample exactly once.
+    _, buckets = session.target_rollup.capture(0, 10**12)
+    assert sum(b["count"] for b in buckets) == len(samples)
+
+
+def test_budget_admission_skips_without_fake_losses(monkeypatch) -> None:
+    """Whole-round admission: a plan larger than the process budget never
+    launches (no partial rounds, no fabricated losses), the pending-round
+    cap halts launches with no growing task backlog, and pause releases
+    every budget."""
+    import netplot.session as session_module
+
+    calls: dict[str, int] = {"n": 0}
+
+    async def never_replies(_host, _timeout_s):
+        calls["n"] += 1
+        await asyncio.sleep(5.0)
+        return 1.0
+
+    async def run():
+        from netplot.session import Hop
+
+        monkeypatch.setattr(session_module, "MAX_OUTSTANDING_PROBES", 2)
+        monkeypatch.setattr(session_module, "MAX_PENDING_ROUNDS", 2)
+        mgr = SessionManager(
+            probe_fn=never_replies,
+            discover_fn=_failing_discover,
+            resolve_name_fn=_fast_resolve_name,
+            probe_timeout_s=3.0,
+        )
+
+        # Plan of 3 probes (2 hops + uncovered target) vs budget 2: the
+        # whole-round rule admits nothing at all — no partial launch.
+        big = mgr.create("target.example", interval_s=0.01)
+        big.route_state = "ready"
+        big.target_ip = "192.0.2.99"  # not the final hop -> target probed too
+        big.hops = [
+            Hop(index=1, ip="10.0.0.1", dns=None),
+            Hop(index=2, ip="10.0.0.2", dns=None),
+        ]
+        await mgr.start(big)
+        await asyncio.sleep(0.1)
+        assert calls["n"] == 0
+        assert len(big.samples) == 0
+        assert big.hops[0].probes == 0, "skipped sends never count as losses"
+        assert big.hops[1].probes == 0
+        await mgr.pause(big)
+
+        # Single-probe plan fits the budget but the pending-round cap
+        # halts launches: backlog stops at the cap, no queue growth.
+        small = mgr.create("example.com", interval_s=0.01)
+        await mgr.start(small)
+        await asyncio.sleep(0.1)
+        assert small._pending_rounds == 2
+        assert small._probe_permits == 2
+        assert calls["n"] == 2
+        assert len(small.samples) == 0, "pending work is not a loss"
+        await mgr.pause(small)
+        assert small._probe_permits == 0
+        assert small._pending_rounds == 0
+        assert len(small.samples) == 0
+        assert calls["n"] == 2, "cancelled probes never complete"
+
+        # Degenerate never-fits case: budget 0 blocks even a 1-probe plan.
+        monkeypatch.setattr(session_module, "MAX_OUTSTANDING_PROBES", 0)
+        blocked = mgr.create("example.com", interval_s=0.01)
+        await mgr.start(blocked)
+        await asyncio.sleep(0.05)
+        await mgr.pause(blocked)
+        assert len(blocked.samples) == 0
+        assert blocked._probe_permits == 0
+        assert blocked._pending_rounds == 0
+
+    asyncio.run(run())
+    assert calls["n"] == 2
+
+
+def test_skipped_deadlines_resume_without_catchup_burst(monkeypatch) -> None:
+    """While the budget blocks every launch the deadline grid keeps
+    advancing; when capacity exists again rounds resume on the grid — one
+    launch per interval, never a burst of all missed deadlines."""
+    import netplot.session as session_module
+
+    launches: list[float] = []
+
+    async def instant(_host, _timeout_s):
+        launches.append(time.monotonic())
+        return 4.0
+
+    async def run():
+        monkeypatch.setattr(session_module, "MAX_OUTSTANDING_PROBES", 0)
+        mgr = SessionManager(
+            probe_fn=instant,
+            discover_fn=_failing_discover,
+            resolve_name_fn=_fast_resolve_name,
+            probe_timeout_s=3.0,
+        )
+        session = mgr.create("example.com", interval_s=0.05)
+        await mgr.start(session)
+        await asyncio.sleep(0.1)  # ~5 deadlines, all skipped
+        assert len(launches) == 0
+        monkeypatch.setattr(session_module, "MAX_OUTSTANDING_PROBES", 45)
+        await asyncio.sleep(0.15)
+        await mgr.pause(session)
+
+    asyncio.run(run())
+    assert len(launches) >= 2
+    gaps = [b - a for a, b in itertools.pairwise(launches)]
+    # Each launch sits one interval after the previous one on the grid; a
+    # catch-up burst would show near-zero gaps.
+    assert all(g >= 0.045 for g in gaps)
+
+
+def test_pause_discards_uncommitted_rounds_and_blocks_later_writes() -> None:
+    """Pause cancels outstanding rounds, awaits their probe children, and
+    no cancelled round appends, aggregates, or publishes afterwards."""
+    completions: list[str] = []
+
+    async def slow_probe(_host, _timeout_s):
+        await asyncio.sleep(0.2)
+        completions.append("done")
+        return 7.0
+
+    async def run():
+        mgr = SessionManager(
+            probe_fn=slow_probe,
+            discover_fn=_failing_discover,
+            resolve_name_fn=_fast_resolve_name,
+            probe_timeout_s=3.0,
+        )
+        session = mgr.create("example.com", interval_s=0.05)
+        queue = session.subscribe()
+        await mgr.start(session)
+        await asyncio.sleep(0.3)
+        await mgr.pause(session)
+        frozen_samples = len(session.samples)
+        frozen_completions = len(completions)
+        frozen_events = queue.qsize()
+        await asyncio.sleep(0.3)  # longer than one probe duration
+        assert len(session.samples) == frozen_samples
+        assert len(completions) == frozen_completions
+        assert queue.qsize() == frozen_events
+        assert session._probe_permits == 0
+        assert session._pending_rounds == 0
+
+    asyncio.run(run())
+
+
+def test_resume_single_generation_then_delete_stops_everything() -> None:
+    """Resume starts exactly one fresh scheduler generation; delete stops
+    probing, awaits all round children, and nothing writes afterwards."""
+    launches: list[float] = []
+    in_flight = 0
+    peak = 0
+
+    async def slow_probe(_host, _timeout_s):
+        nonlocal in_flight, peak
+        launches.append(time.monotonic())
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.15)
+        in_flight -= 1
+        return 2.0
+
+    async def run():
+        mgr = SessionManager(
+            probe_fn=slow_probe,
+            discover_fn=_failing_discover,
+            resolve_name_fn=_fast_resolve_name,
+            probe_timeout_s=3.0,
+        )
+        session = mgr.create("example.com", interval_s=0.05)
+        await mgr.start(session)
+        await asyncio.sleep(0.2)
+        await mgr.pause(session)
+        before_resume = len(session.samples)
+        launches_before_resume = len(launches)
+        await mgr.resume(session)
+        assert session._task is not None and not session._task.done()
+        assert session.state == "running"
+        assert session.paused_at is None
+        await asyncio.sleep(0.35)
+        await mgr.delete(session)
+        assert session._task is None or session._task.done()
+        after_delete = len(session.samples)
+        launches_after_delete = len(launches)
+        await asyncio.sleep(0.2)
+        assert len(session.samples) == after_delete, "no writes after delete"
+        assert len(launches) == launches_after_delete, "no launches after delete"
+        return session, before_resume, launches_before_resume
+
+    session, before_resume, launches_before_resume = asyncio.run(run())
+    assert len(session.samples) > before_resume, "resume produced new rounds"
+    assert len(launches) > launches_before_resume, "resume relaunched the scheduler"
+    assert session._closed
+    assert session._probe_permits == 0
+    assert session._pending_rounds == 0
+    assert peak >= 2, "probes from consecutive rounds overlapped"
+
+
+def test_shutdown_awaits_round_children_of_every_session() -> None:
+    """Shutdown cancels and awaits every session's collectors and probe
+    tasks; cancelled probes never complete and never write afterwards."""
+    completions: list[str] = []
+
+    async def slow_probe(_host, _timeout_s):
+        await asyncio.sleep(0.2)
+        completions.append("done")
+        return 1.0
+
+    async def run():
+        mgr = SessionManager(
+            probe_fn=slow_probe,
+            discover_fn=_failing_discover,
+            resolve_name_fn=_fast_resolve_name,
+            probe_timeout_s=3.0,
+        )
+        sessions = [mgr.create("example.com", interval_s=0.05) for _ in range(3)]
+        for session in sessions:
+            await mgr.start(session)
+        await asyncio.sleep(0.1)
+        await mgr.shutdown()
+        frozen = len(completions)
+        assert frozen == 0  # every in-flight probe was cancelled, not awaited
+        for session in sessions:
+            assert session._task is None or session._task.done()
+            assert session._probe_permits == 0
+            assert session._pending_rounds == 0
+        await asyncio.sleep(0.3)  # longer than one probe duration
+        assert len(completions) == frozen, "no completions after shutdown"
+
+    asyncio.run(run())
+
+
+def test_discovery_handoff_keeps_alias_and_one_commit_per_round() -> None:
+    """Rounds outstanding across the discovery handoff: pre-route rounds
+    commit the target entry, post-route rounds commit the hop entries, the
+    final-hop==target deque/rollup alias holds, and the shared stream gets
+    exactly one sample per committed round."""
+    launches: list[float] = []
+
+    async def fake_probe(host, _timeout_s):
+        launches.append(time.monotonic())
+        await asyncio.sleep(0.12)  # spans the discovery handoff
+        return 3.0
+
+    async def run():
+        from netplot.engine import RouteHop
+
+        hops = [
+            RouteHop(index=1, ip="10.0.0.1"),
+            RouteHop(index=2, ip="192.0.2.10"),  # final hop IS the target
+        ]
+        mgr = _mgr_with_hops(
+            hops,
+            probe_fn=fake_probe,
+            delay_s=0.2,
+            target_ip="192.0.2.10",
+        )
+        session = mgr.create("192.0.2.10", interval_s=0.05)
+        queue = session.subscribe()
+        await mgr.start(session)
+        await asyncio.sleep(0.8)
+        await mgr.pause(session)
+        events = []
+        while True:
+            try:
+                event = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(event, RoundEvent):
+                events.append(event)
+        return session, events
+
+    session, events = asyncio.run(run())
+    assert session.route_state == "ready"
+    assert session.hops[-1].samples is session.samples
+    assert session.hops[-1].rollup is session.target_rollup
+    pre = [e for e in events if any(r.hop == 0 for r in e.results)]
+    post = [e for e in events if all(r.hop != 0 for r in e.results)]
+    assert pre and post, "expected committed rounds on both handoff sides"
+    for event in post:
+        assert [r.hop for r in event.results] == [1, 2]
+        assert all(r.rtt_ms == pytest.approx(3.0) for r in event.results)
+    # Exactly one committed sample per round in the shared stream — never
+    # a duplicated target sample — launch-ordered, and rollups match.
+    assert len(session.samples) == len(events)
+    ts = [s.t for s in session.samples]
+    assert all(b > a for a, b in itertools.pairwise(ts))
+    assert [e.t for e in events] == ts
+    _, buckets = session.target_rollup.capture(0, 10**12)
+    assert sum(b["count"] for b in buckets) == len(session.samples)
+    assert len(session.hops[0].samples) == len(post), (
+        "intermediate hops only sample after discovery delivered them"
+    )
+
+
+def test_resume_persistence_rollback_stops_new_generation(monkeypatch) -> None:
+    """A failed resume persist rolls back to paused: the fresh scheduler
+    generation is cancelled and awaited, and no further rounds launch."""
+    launches: list[float] = []
+
+    async def fake_probe(_host, _timeout_s):
+        launches.append(time.monotonic())
+        return 1.0
+
+    async def run():
+        mgr = SessionManager(
+            probe_fn=fake_probe,
+            discover_fn=_failing_discover,
+            resolve_name_fn=_fast_resolve_name,
+            probe_timeout_s=3.0,
+        )
+        session = mgr.create("example.com", interval_s=0.05, persistent=True)
+        await mgr.start(session)
+        await asyncio.sleep(0.15)
+        await mgr.pause(session)
+        real_persist = mgr._persist_async
+        persist_calls = {"n": 0}
+
+        async def flaky_persist() -> None:
+            persist_calls["n"] += 1
+            if persist_calls["n"] == 1:  # injected after pause; fail resume only
+                raise RuntimeError("simulated fsync failure")
+            await real_persist()
+
+        monkeypatch.setattr(mgr, "_persist_async", flaky_persist)
+        with pytest.raises(RuntimeError):
+            await mgr.resume(session)
+        assert session.state == "paused"
+        assert session.paused_at is not None
+        assert session._task is None or session._task.done()
+        assert session._probe_permits == 0
+        assert session._pending_rounds == 0
+        after_rollback = len(launches)
+        frozen_samples = len(session.samples)
+        await asyncio.sleep(0.15)
+        assert len(launches) == after_rollback, "no new scheduler generation"
+        assert len(session.samples) == frozen_samples
 
     asyncio.run(run())

@@ -22,6 +22,11 @@ Covers:
   points the app at a per-test ``data_dir``: the sample/rollup sets contain
   exactly what the test injects, no real probe/traceroute/DNS runs, and no
   leftover default-dir ``sessions.json`` can boot-restore live sessions.
+- Ordered-commit regression for the overlapping scheduler: a held first
+  round with later rounds finishing first must keep raw history, minute
+  rollups, snapshot stats, metrics capture, and subscriber round events
+  consistent (launch order, exactly-once, alias folded once, no canceled
+  work after pause).
 """
 
 from __future__ import annotations
@@ -33,10 +38,13 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from netplot.engine import RouteHop
+from netplot.metrics import capture_metrics
 from netplot.session import (
     ROLLUP_BUCKET_S,
     ROLLUP_CAP,
     Hop,
+    RouteEvent,
     SessionManager,
     StreamRollup,
     TraceSession,
@@ -612,3 +620,258 @@ def test_probe_round_folds_samples_into_rollup() -> None:
     for b in buckets:
         if b["count"] > 0 and b["loss_count"] < b["count"]:
             assert math.isclose(b["avg_ms"], 5.0, rel_tol=1e-9)
+
+
+# ---------------------------------------- ordered-commit regression (overlap)
+#
+# PingPlotter-parity contract (docs/plan-pingplotter-timing.md §1.4): rounds
+# overlap, collection is asynchronous, and completed rounds commit in LAUNCH
+# order. The regression below drives the real scheduler with a scripted
+# probe_fn (asyncio events only — no wall-clock waits) and checks the commit
+# boundary in every consumer at once — raw deque/history, the minute rollup
+# tier, snapshot current/count/loss with cutoffs, metrics capture, and the
+# subscriber round-event feed — while a later round finishes BEFORE an
+# earlier one. Every reader of the boundary must agree: nothing becomes
+# visible until the held round commits; after it does, each round appears
+# exactly once, launch-ordered, with the destination/final-hop alias folded
+# a single time; pausing with later rounds still blocked must not leak any
+# canceled uncommitted work anywhere.
+
+#: TEST-NET-3 literal. ``SessionManager._resolve_target`` short-circuits IP
+#: literals (no DNS), so the injected discovery completes within its first
+#: task step — deterministically before the second scheduler tick.
+_OVERLAP_TARGET = "203.0.113.9"
+
+
+async def _drive_ordered_commit_scenario() -> dict:
+    """Drive the overlapping scheduler through a held-first-round scenario.
+
+    Deterministic sequence, gated entirely by asyncio events:
+
+    - Round 1 (planned target-only, launched before discovery ran) is held
+      on ``release_round1``: its RTT (30.0) is only produced when released.
+    - Injected discovery establishes the final-hop-is-target alias while
+      round 1 is still outstanding (the production rebinding path).
+    - Round 2 (a loss) and round 3 (10.0) finish probing while round 1 is
+      held, so both complete BEHIND the uncommitted round 1: until round 1
+      commits, nothing may become visible in any consumer.
+    - Round 4+ launch behind them and block forever, so the session ends up
+      paused with later rounds outstanding: canceled uncommitted work must
+      not leak into any consumer.
+
+    Mid-flight observations are captured on-loop and returned with handles
+    and the on-loop metrics captures for the tests to assert on.
+    """
+    started: list[asyncio.Event] = [asyncio.Event() for _ in range(4)]
+    release_round1 = asyncio.Event()
+    block_later_rounds = asyncio.Event()  # never set while the session runs
+    probe_hosts: list[str] = []
+
+    async def scripted_probe(host: str, _timeout_s: float) -> float | None:
+        call = len(probe_hosts)
+        probe_hosts.append(host)
+        if call < len(started):
+            started[call].set()
+        if call == 0:
+            await release_round1.wait()  # round 1: held until released
+            return 30.0
+        if call == 1:
+            return None  # round 2: a loss, finishes immediately
+        if call == 2:
+            return 10.0  # round 3, finishes while round 1 is still held
+        await block_later_rounds.wait()  # round 4+: never completes
+        raise AssertionError("block_later_rounds must never be set")
+
+    async def injected_discover(_target: str, _timeout_s: float = 90.0):
+        return [RouteHop(index=1, ip=_OVERLAP_TARGET)]
+
+    async def no_resolve_name(_ip: str) -> None:
+        return None
+
+    mgr = SessionManager(
+        probe_fn=scripted_probe,
+        discover_fn=injected_discover,
+        resolve_name_fn=no_resolve_name,
+    )
+    session = mgr.create(_OVERLAP_TARGET, interval_s=0.01)
+    events: asyncio.Queue = session.subscribe()
+    await mgr.start(session)
+
+    # Discovery runs without a single loop suspension for an IP literal
+    # target, so the route event is the subscriber feed's first message —
+    # and it arrives while round 1 is still held, i.e. the alias was
+    # established by the production discovery path while a pre-route round
+    # remained outstanding.
+    route_event = await asyncio.wait_for(events.get(), 5.0)
+    assert isinstance(route_event, RouteEvent)
+    assert session.route_state == "ready"
+    assert session.hops[-1].samples is session.samples
+    assert session.hops[-1].rollup is session.target_rollup
+
+    # Rounds 1-3 are all launched; rounds 2/3 finish probing behind the
+    # held round 1 and park on its commit event.
+    await asyncio.wait_for(started[2].wait(), 5.0)
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    # Mid-flight capture: taken before the release, on-loop.
+    mid_samples = len(session.samples)
+    _, mid_buckets = session.target_rollup.capture(0, 10**12)
+    mid_snapshot = session.snapshot(0)
+    mid_metrics = capture_metrics(mgr)
+    mid_queue_size = events.qsize()
+
+    # A later round (4th) launches while round 1 is still held and blocks.
+    await asyncio.wait_for(started[3].wait(), 5.0)
+
+    # Release the held round: rounds 1..3 commit, in launch order.
+    release_round1.set()
+    round_events = [await asyncio.wait_for(events.get(), 5.0) for _ in range(3)]
+    for _ in range(10):
+        await asyncio.sleep(0)
+    committed_metrics = capture_metrics(mgr)
+
+    # Pause with the blocked later rounds still outstanding.
+    await mgr.pause(session)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    paused_metrics = capture_metrics(mgr)
+
+    return {
+        "session": session,
+        "manager": mgr,
+        "events": events,
+        "route_event": route_event,
+        "round_events": round_events,
+        "probe_hosts": probe_hosts,
+        "mid": {
+            "sample_count": mid_samples,
+            "buckets": mid_buckets,
+            "snapshot_stats": mid_snapshot["stats"],
+            "snapshot_cutoffs": (
+                mid_snapshot["sample_through_t"],
+                mid_snapshot["sample_from_t"],
+            ),
+            "metrics": mid_metrics,
+            "queue_size": mid_queue_size,
+        },
+        "committed_metrics": committed_metrics,
+        "paused_metrics": paused_metrics,
+    }
+
+
+def test_overlapping_rounds_commit_launch_ordered_across_all_consumers() -> None:
+    """A held round must gate every consumer; after release each round
+    commits exactly once, launch-ordered, and canceled later rounds leak
+    nowhere.
+
+    Scenario: three rounds dispatched a tick apart with RTTs 30.0 / loss /
+    10.0. Round 1 is held; rounds 2 and 3 finish first. Before the release
+    nothing is visible anywhere; after it the committed stream is
+    30, None, 10 — so current 10, avg 20, loss 1/3, one rollup bucket with
+    count 3 / loss 1, and three launch-ordered round events. Discovery
+    makes the final hop the target mid-flight, so the alias stream/rollup
+    must be folded once (count 3, not doubled), and a final pause with
+    blocked rounds must change nothing.
+    """
+    obs = asyncio.run(_drive_ordered_commit_scenario())
+    session = obs["session"]
+    events = obs["events"]
+    ev1, ev2, ev3 = obs["round_events"]
+    ts1, ts2, ts3 = ev1.t, ev2.t, ev3.t
+
+    # --- mid-flight: finished later rounds are invisible until the held
+    # round commits; every consumer agrees on "nothing yet".
+    mid = obs["mid"]
+    assert mid["sample_count"] == 0
+    assert mid["buckets"] == []
+    assert mid["queue_size"] == 0
+    assert mid["snapshot_stats"]["count"] == 0
+    assert mid["snapshot_stats"]["cur_ms"] is None
+    assert mid["snapshot_cutoffs"] == (None, None)
+    assert len(mid["metrics"]) == 1
+    assert mid["metrics"][0].target_stream is None
+    assert mid["metrics"][0].hops == []
+
+    # --- subscriber feed: one existing-format round event per round, in
+    # launch order. Round 1 was planned pre-route (target stream under
+    # hop 0); rounds 2/3 run as the destination alias hop.
+    assert [(r.hop, r.rtt_ms) for r in ev1.results] == [(0, 30.0)]
+    assert [(r.hop, r.rtt_ms) for r in ev2.results] == [(1, None)]
+    assert [(r.hop, r.rtt_ms) for r in ev3.results] == [(1, 10.0)]
+    assert ts1 <= ts2 <= ts3  # event order == launch order
+    assert events.qsize() == 0  # exactly once: no duplicates, no extras
+
+    # --- raw history: exactly one append per round, launch-ordered.
+    assert [(s.t, s.rtt_ms) for s in session.samples] == [
+        (ts1, 30.0),
+        (ts2, None),
+        (ts3, 10.0),
+    ]
+    earliest, raw0 = session.history_samples(0, ts1 - 1.0, ts3 + 1.0)
+    assert earliest == ts1
+    assert raw0 == [(ts1, 30.0), (ts2, None), (ts3, 10.0)]
+    # Destination/final-hop alias: hop 1 resolves to the SAME stream...
+    assert session.hops[-1].samples is session.samples
+    _, raw1 = session.history_samples(1, ts1 - 1.0, ts3 + 1.0)
+    assert raw1 == raw0
+
+    # --- minute rollup: folded once per committed sample, losses counted
+    # in count but not in the average; the alias adds no second fold.
+    bucket_t = int(ts1 // ROLLUP_BUCKET_S) * ROLLUP_BUCKET_S
+    earliest_b, buckets = session.history_buckets(0, 0, 10**12)
+    assert earliest_b == bucket_t
+    assert len(buckets) == 1
+    b = buckets[0]
+    assert b["t"] == bucket_t
+    assert b["count"] == 3  # NOT 4/6: no double aggregate via the alias
+    assert b["loss_count"] == 1
+    assert math.isclose(b["avg_ms"], 20.0)
+    assert math.isclose(b["min_ms"], 10.0)
+    assert math.isclose(b["max_ms"], 30.0)
+    assert session.hops[-1].rollup is session.target_rollup
+    _, hop_buckets = session.history_buckets(1, 0, 10**12)
+    assert hop_buckets == buckets
+
+    # --- snapshot: current comes from the newest COMMITTED round (10.0,
+    # not the newest reply), and the cutoffs bracket exactly this window.
+    snap = session.snapshot(0)
+    st = snap["stats"]
+    assert st["count"] == 3
+    assert st["cur_ms"] == 10.0
+    assert math.isclose(st["avg_ms"], 20.0)
+    assert math.isclose(st["loss_pct"], 100.0 / 3.0)
+    assert (snap["sample_through_t"], snap["sample_from_t"]) == (ts3, ts1)
+    # The alias hop's entry in the same payload describes the same window.
+    assert snap["hops"][0]["stats"] == st
+    assert snap["hops"][0]["sample_through_t"] == ts3
+    assert snap["hops"][0]["sample_from_t"] == ts1
+    assert snap["hops"][0]["captured_at"] == snap["captured_at"]
+
+    # --- metrics capture: exactly the committed rounds.
+    committed = obs["committed_metrics"]
+    assert len(committed) == 1
+    tm = committed[0].target_stream
+    assert tm is not None
+    assert tm.current_ms == 10.0
+    assert math.isclose(tm.avg_ms, 20.0)
+    assert math.isclose(tm.loss_pct, 100.0 / 3.0)
+    assert tm.up == 1
+    assert [(h.hop_index, h.current_ms) for h in committed[0].hops] == [(1, 10.0)]
+
+    # --- paused with later rounds blocked outstanding: canceled
+    # uncommitted work must not appear anywhere.
+    assert len(obs["probe_hosts"]) >= 4  # a later round really was blocked
+    assert session.state == "paused"
+    assert [(s.t, s.rtt_ms) for s in session.samples] == [
+        (ts1, 30.0),
+        (ts2, None),
+        (ts3, 10.0),
+    ]
+    _, buckets_after_pause = session.history_buckets(0, 0, 10**12)
+    assert buckets_after_pause == buckets
+    assert events.qsize() == 0  # no canceled round published a loss/event
+    paused = obs["paused_metrics"]
+    assert paused[0].state == "paused"
+    assert paused[0].target_stream == tm  # values frozen, nothing added
+    assert paused[0].hops == committed[0].hops

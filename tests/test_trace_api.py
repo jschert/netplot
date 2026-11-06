@@ -384,9 +384,13 @@ def test_snapshot_reads_live_buffers_on_probe_event_loop(
                     assert asyncio.get_running_loop() is probe_loop
                     return super().__iter__()
 
-            session.samples = LoopBoundDeque([Sample(t=time.time(), rtt_ms=7.0)])
+            # Stamp at the frozen paused_at anchor: a post-pause wall-clock
+            # stamp would be future-dated relative to the snapshot's
+            # captured_at right edge and excluded from every window.
+            anchor = session.paused_at
+            session.samples = LoopBoundDeque([Sample(t=anchor, rtt_ms=7.0)])
             route_hop = Hop(index=1, ip="10.0.0.1", dns="router.lan")
-            route_hop.samples = LoopBoundDeque([Sample(t=time.time(), rtt_ms=9.0)])
+            route_hop.samples = LoopBoundDeque([Sample(t=anchor, rtt_ms=9.0)])
             session.hops = [route_hop]
 
         client.portal.call(install_loop_bound_buffers)
@@ -425,6 +429,9 @@ def test_snapshot_payload_shape_for_empty_session() -> None:
             "focus_s",
             "name",
             "persistent",
+            "captured_at",
+            "sample_through_t",
+            "sample_from_t",
             "hops",
             "stats",
             "samples",
@@ -434,6 +441,11 @@ def test_snapshot_payload_shape_for_empty_session() -> None:
         assert body["stats"]["avg_ms"] is None
         assert body["samples"] == []
         assert body["hops"] == []
+        # Empty stream → null cutoffs (no baseline to adopt); captured_at is
+        # the frozen paused_at anchor for this paused session.
+        assert body["sample_through_t"] is None
+        assert body["sample_from_t"] is None
+        assert isinstance(body["captured_at"], float)
         # route_state is one of pending/ready/failed. After an immediate pause
         # discovery may have completed or not — either is acceptable; the
         # important contract is that the key exists with a known value.
@@ -469,10 +481,13 @@ def test_snapshot_reflects_injected_samples() -> None:
         sid = _create_then(client)
         app = client.app
         session = app.state.session_manager.get(sid)
-        client.post(f"/api/traces/{sid}/pause")
-        session.append_sample(5.0, t=time.time() - 30)
-        session.append_sample(10.0, t=time.time() - 10)
-        session.append_sample(15.0, t=time.time() - 1)
+        paused_at = client.post(f"/api/traces/{sid}/pause").json()["paused_at"]
+        # Synthetic samples sit at/before the frozen paused_at anchor — a
+        # post-pause wall-clock stamp would be future-dated relative to the
+        # snapshot's captured_at right edge.
+        session.append_sample(5.0, t=paused_at - 30)
+        session.append_sample(10.0, t=paused_at - 10)
+        session.append_sample(15.0, t=paused_at - 1)
 
         body = client.get(f"/api/traces/{sid}/snapshot?focus=60").json()
         assert body["stats"]["count"] == 3
@@ -480,6 +495,202 @@ def test_snapshot_reflects_injected_samples() -> None:
         assert body["stats"]["min_ms"] == pytest.approx(5.0)
         assert body["stats"]["cur_ms"] == pytest.approx(15.0)
         assert len(body["samples"]) == 3
+
+
+def test_snapshot_cutoffs_are_extrema_of_exact_stats_window() -> None:
+    """Cutoffs describe exactly the samples the stats were computed from.
+
+    A sample older than the focus window is excluded from both stats and
+    cutoffs; a sample newer than the captured_at anchor is excluded too
+    (the anchor is a hard right edge), while a sample exactly at the anchor
+    is included; losses are committed samples, so they count in stats and
+    bound the cutoffs like any other sample.
+    """
+    with TestClient(create_app(), base_url="http://localhost") as client:
+        sid = _create_then(client)
+        session = client.app.state.session_manager.get(sid)
+        paused_at = client.post(f"/api/traces/{sid}/pause").json()["paused_at"]
+        base = paused_at  # paused snapshots anchor their window at paused_at
+        session.append_sample(1.0, t=base - 500)  # older than focus=60 → out
+        session.append_sample(2.0, t=base - 40)
+        session.append_sample(None, t=base - 20)  # loss → in stats and cutoffs
+        session.append_sample(3.0, t=base - 10)
+        session.append_sample(4.0, t=base)  # exactly at the anchor → in
+        session.append_sample(9.0, t=base + 45)  # future-dated vs anchor → out
+
+        body = client.get(f"/api/traces/{sid}/snapshot?focus=60").json()
+        assert body["stats"]["count"] == 4
+        assert body["stats"]["cur_ms"] == pytest.approx(4.0)
+        assert body["stats"]["loss_pct"] == pytest.approx(25.0)
+        assert body["sample_through_t"] == pytest.approx(base)
+        assert body["sample_from_t"] == pytest.approx(base - 40)
+        assert body["captured_at"] == pytest.approx(paused_at)
+        # The future-dated record leaks into no part of the payload.
+        assert all(s["t"] <= base for s in body["samples"])
+
+
+def test_snapshot_future_samples_excluded_across_target_hops_and_singlehop() -> None:
+    """The captured_at anchor is a hard right edge for EVERY window in a
+    snapshot payload — top-level target stats/cutoffs/samples, every hops[]
+    entry, and the single-hop (hop=) payload alike. focus=0 with the anchor
+    keeps every retained sample at/before it (however old) but never a
+    future-dated record."""
+    with TestClient(create_app(), base_url="http://localhost") as client:
+        sid = _create_then(client)
+        session = client.app.state.session_manager.get(sid)
+        paused_at = client.post(f"/api/traces/{sid}/pause").json()["paused_at"]
+        session.hops = [
+            Hop(index=1, ip="10.0.0.1", dns=None),
+            Hop(index=2, ip="10.0.0.2", dns=None),
+        ]
+        session.route_state = "ready"
+        # Target stream: one old sample, one exactly at the anchor, one
+        # future-dated.
+        session.append_sample(1.0, t=paused_at - 300)
+        session.append_sample(2.0, t=paused_at)
+        session.append_sample(9.0, t=paused_at + 30)
+        # Hop 1: one legitimate sample, one future-dated loss.
+        session.hops[0].samples.append(Sample(t=paused_at - 20, rtt_ms=5.0))
+        session.hops[0].samples.append(Sample(t=paused_at + 10, rtt_ms=None))
+
+        # --- focused window: future records excluded everywhere.
+        body = client.get(f"/api/traces/{sid}/snapshot?focus=60").json()
+        assert body["captured_at"] == pytest.approx(paused_at)
+        assert body["stats"]["count"] == 1  # only the exact-anchor sample
+        assert body["stats"]["cur_ms"] == pytest.approx(2.0)
+        assert body["sample_through_t"] == pytest.approx(paused_at)
+        assert body["sample_from_t"] == pytest.approx(paused_at)
+        assert all(s["t"] <= paused_at for s in body["samples"])
+        h1 = body["hops"][0]
+        assert h1["stats"]["count"] == 1  # future-dated loss excluded
+        assert h1["sample_through_t"] == pytest.approx(paused_at - 20)
+        assert h1["sample_from_t"] == pytest.approx(paused_at - 20)
+        assert body["hops"][1]["sample_through_t"] is None  # empty stream
+
+        # --- focus=0: all retained samples at/before the anchor, never the
+        # future record, however far it sits past the anchor.
+        wide = client.get(f"/api/traces/{sid}/snapshot?focus=0").json()
+        assert wide["stats"]["count"] == 2
+        assert wide["sample_through_t"] == pytest.approx(paused_at)
+        assert wide["sample_from_t"] == pytest.approx(paused_at - 300)
+        wh1 = wide["hops"][0]
+        assert wh1["stats"]["count"] == 1
+        assert wh1["sample_through_t"] == pytest.approx(paused_at - 20)
+
+        # --- single-hop payload: the same exclusion on its own anchor.
+        hop_body = client.get(f"/api/traces/{sid}/snapshot?hop=1&focus=60").json()
+        assert hop_body["captured_at"] == pytest.approx(paused_at)
+        assert hop_body["stats"]["count"] == 1
+        assert hop_body["sample_through_t"] == pytest.approx(paused_at - 20)
+        assert hop_body["sample_from_t"] == pytest.approx(paused_at - 20)
+        hop_wide = client.get(f"/api/traces/{sid}/snapshot?hop=1&focus=0").json()
+        assert hop_wide["stats"]["count"] == 1
+        assert hop_wide["sample_through_t"] == pytest.approx(paused_at - 20)
+        assert hop_wide["sample_from_t"] == pytest.approx(paused_at - 20)
+
+
+def test_snapshot_paused_window_is_frozen_at_paused_at() -> None:
+    """A paused snapshot's window right edge is the frozen paused_at, not
+    wall-clock capture time: backdating the pause instant ages samples out
+    of the window exactly as if they had aged out at the pause itself."""
+    with TestClient(create_app(), base_url="http://localhost") as client:
+        sid = _create_then(client)
+        session = client.app.state.session_manager.get(sid)
+        client.post(f"/api/traces/{sid}/pause")
+        session.paused_at = time.time() - 120  # backdate the frozen anchor
+        session.append_sample(1.0, t=session.paused_at - 10)
+        session.append_sample(2.0, t=session.paused_at - 400)
+
+        body = client.get(f"/api/traces/{sid}/snapshot?focus=60").json()
+        # Right edge paused_at − 60 keeps only the recent sample. A real-time
+        # anchor (now − 60 > paused_at − 10) would have counted zero.
+        assert body["stats"]["count"] == 1
+        assert body["stats"]["avg_ms"] == pytest.approx(1.0)
+        assert body["sample_through_t"] == pytest.approx(session.paused_at - 10)
+        assert body["sample_from_t"] == pytest.approx(session.paused_at - 10)
+        assert body["captured_at"] == pytest.approx(session.paused_at)
+
+
+def test_snapshot_perhop_cutoffs_are_per_stream_on_one_anchor() -> None:
+    """Every hops[] entry carries cutoffs for ITS OWN stats window, all
+    filtered against the payload's single captured_at anchor; an empty
+    stream reports null cutoffs even when sibling hops have data."""
+    with TestClient(create_app(), base_url="http://localhost") as client:
+        sid = _create_then(client)
+        session = client.app.state.session_manager.get(sid)
+        paused_at = client.post(f"/api/traces/{sid}/pause").json()["paused_at"]
+        session.hops = [
+            Hop(index=1, ip="10.0.0.1", dns=None),
+            Hop(index=2, ip="10.0.0.2", dns=None),
+        ]
+        session.route_state = "ready"
+        session.hops[0].samples.append(Sample(t=paused_at - 30, rtt_ms=5.0))
+        session.hops[0].samples.append(Sample(t=paused_at - 30, rtt_ms=None))
+        session.hops[1].samples.append(Sample(t=paused_at - 5, rtt_ms=7.0))
+
+        body = client.get(f"/api/traces/{sid}/snapshot?focus=60").json()
+        # One anchor shared by the target payload and every hop entry.
+        assert body["captured_at"] == pytest.approx(paused_at)
+        assert all(h["captured_at"] == pytest.approx(paused_at) for h in body["hops"])
+        # Hop 1: both samples committed at one instant, loss included.
+        h1 = body["hops"][0]
+        assert h1["stats"]["count"] == 2
+        assert h1["sample_through_t"] == pytest.approx(paused_at - 30)
+        assert h1["sample_from_t"] == pytest.approx(paused_at - 30)
+        # Hop 2 has its own stream with its own extrema.
+        h2 = body["hops"][1]
+        assert h2["sample_through_t"] == pytest.approx(paused_at - 5)
+        assert h2["sample_from_t"] == pytest.approx(paused_at - 5)
+        # Target stream empty → null cutoffs despite populated hops.
+        assert body["sample_through_t"] is None
+        assert body["sample_from_t"] is None
+
+
+def test_snapshot_target_and_final_hop_alias_share_cutoffs() -> None:
+    """When the final hop IS the target (shared stream), its hops[] entry
+    and the top-level target payload report identical stats and cutoffs."""
+    with TestClient(create_app(), base_url="http://localhost") as client:
+        sid = _create_then(client)
+        session = client.app.state.session_manager.get(sid)
+        paused_at = client.post(f"/api/traces/{sid}/pause").json()["paused_at"]
+        session.target_ip = "10.0.0.2"
+        session.hops = [
+            Hop(index=1, ip="10.0.0.1", dns=None),
+            Hop(index=2, ip="10.0.0.2", dns=None),
+        ]
+        session.hops[-1].samples = session.samples  # alias, as discovery does
+        session.route_state = "ready"
+        session.append_sample(2.0, t=paused_at - 15)
+        session.append_sample(None, t=paused_at - 5)
+
+        body = client.get(f"/api/traces/{sid}/snapshot?focus=60").json()
+        final = body["hops"][-1]
+        assert body["stats"]["count"] == 2
+        assert final["stats"] == body["stats"]
+        assert final["sample_through_t"] == body["sample_through_t"]
+        assert final["sample_from_t"] == body["sample_from_t"]
+        assert final["captured_at"] == body["captured_at"]
+        assert body["sample_through_t"] == pytest.approx(paused_at - 5)
+        assert body["sample_from_t"] == pytest.approx(paused_at - 15)
+        # The non-destination hop keeps its own (empty) stream → null cutoffs.
+        assert body["hops"][0]["sample_through_t"] is None
+
+
+def test_snapshot_hop_empty_stream_has_null_cutoffs() -> None:
+    """Single-hop payload of a hop with no samples: null cutoffs, and the
+    anchor is the frozen paused_at (never the request receipt time)."""
+    with TestClient(create_app(), base_url="http://localhost") as client:
+        sid = _create_then(client)
+        session = client.app.state.session_manager.get(sid)
+        paused_at = client.post(f"/api/traces/{sid}/pause").json()["paused_at"]
+        session.hops = [Hop(index=1, ip="10.0.0.1", dns=None)]
+        session.route_state = "ready"
+
+        body = client.get(f"/api/traces/{sid}/snapshot?hop=1&focus=60").json()
+        assert body["stats"]["count"] == 0
+        assert body["sample_through_t"] is None
+        assert body["sample_from_t"] is None
+        assert body["captured_at"] == pytest.approx(paused_at)
 
 
 # --------------------------------------------------------------- history (D1)
@@ -775,7 +986,7 @@ def test_history_snapshot_is_decoupled_from_live_deques() -> None:
 #
 # GET /api/traces/{id}/export?format=csv returns the full server-held
 # sample history as a flat CSV table (header: timestamp_utc,timestamp_epoch,
-# hop_index,ip,dns,rtt_ms). The server's per-hop buffers are authoritative;
+# hop_index,ip,dns,rtt_ms,packet_lost). The per-hop buffers are authoritative;
 # hop indexing mirrors the SSE contract (hop>=1 route hops, hop 0 the target
 # stream only when the route does not reach the target). Works running and
 # paused; 404 unknown session; 400 unsupported format.
@@ -805,11 +1016,13 @@ def _parse_csv(text: str) -> list[dict[str, str]]:
     return list(reader)
 
 
-def test_export_csv_shape_and_loss_encoding() -> None:
+@pytest.mark.parametrize("reply_rtt", [0.0, 1.5])
+def test_export_csv_shape_and_loss_encoding(reply_rtt: float) -> None:
     """Header + one row per sample; rtt_ms empty for losses; sorted by t,hop.
 
-    Target-only (route pending): samples export under hop 0 with the
-    resolved target IP/DNS columns.
+    Explicit loss flags distinguish lost probes from replies, including
+    zero RTT. Target-only (route pending): samples export under hop 0 with
+    the resolved target IP/DNS columns.
     """
     with TestClient(create_app(), base_url="http://localhost") as client:
         sid = _create_then(client)
@@ -819,7 +1032,7 @@ def test_export_csv_shape_and_loss_encoding() -> None:
         session.target_ip = "127.0.0.1"
         session.target_dns = "localhost"
         now = time.time()
-        session.append_sample(1.5, t=now)
+        session.append_sample(reply_rtt, t=now)
         session.append_sample(None, t=now + 1)  # loss -> empty rtt_ms
 
         r = client.get(f"/api/traces/{sid}/export?format=csv")
@@ -842,15 +1055,18 @@ def test_export_csv_shape_and_loss_encoding() -> None:
             "ip",
             "dns",
             "rtt_ms",
+            "packet_lost",
         ]
         # Target-only stream -> hop_index 0, target IP/DNS carried.
         assert rows[0]["hop_index"] == "0"
         assert rows[0]["ip"] == "127.0.0.1"
         assert rows[0]["dns"] == "localhost"
-        assert rows[0]["rtt_ms"] == "1.500"
+        assert rows[0]["rtt_ms"] == f"{reply_rtt:.3f}"
+        assert rows[0]["packet_lost"] == "0"
         # Loss sample: empty rtt_ms, hop_index still 0.
         assert rows[1]["hop_index"] == "0"
         assert rows[1]["rtt_ms"] == ""
+        assert rows[1]["packet_lost"] == "1"
         # Rows ordered by timestamp ascending.
         assert float(rows[0]["timestamp_epoch"]) <= float(rows[1]["timestamp_epoch"])
         # UTC column is ISO 8601 with a trailing Z.
@@ -928,6 +1144,7 @@ def test_export_csv_silent_tail_emits_target_as_hop_0() -> None:
         assert silent["ip"] == ""
         assert silent["dns"] == ""
         assert silent["rtt_ms"] == ""
+        assert silent["packet_lost"] == "1"
 
 
 def test_export_works_while_running_and_while_paused() -> None:
@@ -1613,7 +1830,7 @@ def test_snapshot_hop_param_returns_per_hop_stats() -> None:
         sid = _create_then(client)
         app = client.app
         session = app.state.session_manager.get(sid)
-        client.post(f"/api/traces/{sid}/pause")
+        paused_at = client.post(f"/api/traces/{sid}/pause").json()["paused_at"]
         # Inject hops + samples directly so the test does not depend on
         # traceroute availability.
         from netplot.session import Hop
@@ -1621,9 +1838,12 @@ def test_snapshot_hop_param_returns_per_hop_stats() -> None:
 
         session.hops = [Hop(index=1, ip="10.0.0.1", dns="router")]
         session.route_state = "ready"
-        now = time.time()
+        # Synthetic samples sit at/before the frozen paused_at anchor (a
+        # post-pause wall-clock stamp would be future-dated relative to the
+        # snapshot's captured_at right edge).
+        stamp = paused_at - 10.0
         for rtt in (5.0, 10.0, None):
-            session.hops[0].samples.append(NpSample(t=now, rtt_ms=rtt))
+            session.hops[0].samples.append(NpSample(t=stamp, rtt_ms=rtt))
 
         r = client.get(f"/api/traces/{sid}/snapshot?hop=1&focus=0")
         assert r.status_code == 200
@@ -1637,6 +1857,9 @@ def test_snapshot_hop_param_returns_per_hop_stats() -> None:
             "internal",
             "icmp_non_responsive",
             "focus_s",
+            "captured_at",
+            "sample_through_t",
+            "sample_from_t",
             "stats",
             "samples",
         }
@@ -1646,6 +1869,12 @@ def test_snapshot_hop_param_returns_per_hop_stats() -> None:
         assert body["stats"]["count"] == 3
         assert body["stats"]["loss_pct"] == pytest.approx(100.0 / 3.0)
         assert len(body["samples"]) == 3
+        # focus=0 → the whole at/before-anchor stream is the stats window, so
+        # both cutoffs are the injected samples' single epoch; captured_at is
+        # the frozen paused_at anchor, not the request receipt time.
+        assert body["sample_through_t"] == pytest.approx(stamp)
+        assert body["sample_from_t"] == pytest.approx(stamp)
+        assert body["captured_at"] == pytest.approx(paused_at)
 
 
 def test_snapshot_hop_param_returns_404_for_unknown_hop() -> None:
@@ -1681,7 +1910,8 @@ def test_snapshot_route_state_transitions_to_ready() -> None:
         assert body["route_state"] == "ready"
         assert len(body["hops"]) == 2
         assert [h["index"] for h in body["hops"]] == [1, 2]
-        # Each hop carries stats.
+        # Each hop carries stats plus its own cutoff trio (same captured_at
+        # anchor as the target payload).
         for h in body["hops"]:
             assert set(h.keys()) == {
                 "index",
@@ -1689,6 +1919,9 @@ def test_snapshot_route_state_transitions_to_ready() -> None:
                 "dns",
                 "internal",
                 "icmp_non_responsive",
+                "captured_at",
+                "sample_through_t",
+                "sample_from_t",
                 "stats",
             }
             assert set(h["stats"].keys()) == {

@@ -56,13 +56,17 @@ Toolbar cloned from the PingPlotter Cloud reference (no backend changes).
 - **Interval preset dropdown.** `#interval` is now a `<select>` (ID
   preserved; element type changed from `<input type=number>`) with 1 /
   2.5 / 5 / 10 / 30 / 60 s options, 2.5 preselected. The value feeds the
-  same `interval_s` POST body.
+  same `interval_s` POST body. Send deadlines are independent of the
+  three-second reply window; overlapping rounds preserve the selected
+  cadence while the per-trace resource budget allows it.
 - **Focus dropdown.** `#focus-window` (Auto / 1 minute / 5 minutes /
   10 minutes) controls the hop-table stats window — table stats, per-row
   graph whiskers, the seed/live combination in `PURE.statsForHopWindow`,
-  the snapshot fetch `?focus=<seconds>`, and the seed-baseline expiry
-  (`seedUntil = snapshot's last sample t + focusS`) all follow the
-  selected window. **Manual drag-focus overrides the dropdown** until
+  the snapshot fetch `?focus=<seconds>`, and coverage-aware accounting all
+  follow the selected window. A loading baseline combines only post-cutoff
+  samples and expires when its oldest included `sample_from_t` leaves the
+  window; complete raw coverage becomes the sole statistics source.
+  **Manual drag-focus overrides the dropdown** until
   cleared: while active, the dropdown's visible value is forced to
   `auto`; clearing the manual focus (focus-chip × or auto-expiry)
   restores the dropdown's preserved selection. The timeline range
@@ -79,7 +83,7 @@ Toolbar cloned from the PingPlotter Cloud reference (no backend changes).
 
 PURE additions, all node-asserted: `targetHistoryAdd`, `focusWindowSeconds`,
 `focusWindowLabel`, `formatClock12`, `formatDateMDY`, `formatFocusCaption`,
-`snapshotExpiry`, `computeStatsWindow`, `statsForHopWindow`, `FOCUS_OPTIONS`,
+`adoptSnapshotBaseline`, `computeStatsWindow`, `statsForHopWindow`, `FOCUS_OPTIONS`,
 `TARGET_HISTORY_MAX`. Disabled-state policy matches PingPlotter Cloud:
 `#target` and `#interval` are locked mid-trace; `#focus-window` stays
 editable.

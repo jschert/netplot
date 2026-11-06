@@ -160,21 +160,34 @@ def test_probe_round_updates_counters_and_flag_roundtrip() -> None:
                 await asyncio.sleep(0.01)
             assert session.hops, "discovery did not populate hops"
 
-            async def rounds(n):
-                for _ in range(n):
-                    await manager._probe_round(session)
+            async def wait_until(predicate, timeout_s=5.0):
+                # Rounds launch on the live scheduler every interval; wait
+                # until the lifetime counters reflect enough committed
+                # rounds (probes are instant fakes, so this is fast).
+                deadline = time.monotonic() + timeout_s
+                while time.monotonic() < deadline:
+                    if predicate():
+                        return True
+                    await asyncio.sleep(0.01)
+                return False
 
-            await rounds(ICMP_NONRESPONSIVE_MIN_PROBES)
             intermediate, destination = session.hops[0], session.hops[1]
-            assert intermediate.probes >= ICMP_NONRESPONSIVE_MIN_PROBES
+            assert await wait_until(
+                lambda: intermediate.probes >= ICMP_NONRESPONSIVE_MIN_PROBES
+            ), "intermediate hop never accumulated the probe rounds"
             assert session.hop_icmp_non_responsive(intermediate) is True
             assert session.hop_icmp_non_responsive(destination) is False
 
             # Later recovery: the intermediate hop starts replying.
             probe_results["10.0.0.1"] = 12.5
-            await rounds(1)
-            assert session.hops[0].replies == 1
+            assert await wait_until(
+                lambda: intermediate.replies >= 1
+            ), "intermediate hop never committed a successful reply"
             assert session.hop_icmp_non_responsive(session.hops[0]) is False
+
+            # Settle: stop the scheduler so the snapshot reads a quiet
+            # session (pause awaits all outstanding rounds' cancellation).
+            await manager.pause(session)
 
             snap = session.snapshot(focus_s=0)
             by_index = {h["index"]: h for h in snap["hops"]}

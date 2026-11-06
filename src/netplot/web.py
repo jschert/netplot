@@ -654,8 +654,16 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         focus: float = DEFAULT_FOCUS_S,
         hop: int | None = None,
     ) -> dict:
-        # Capture on the probe event loop without yielding: worker-thread
-        # iteration can race with probe writes to the live sample deques.
+        """Snapshot with cutoffs captured atomically on the event loop.
+
+        ``async def`` (not a threadpool ``def``) so the whole capture runs on
+        the loop with no ``await`` between the window, stats, and cutoff
+        reads — a concurrent probe append cannot split ``stats`` from its
+        ``sample_through_t``/``sample_from_t``, and the live deques are never
+        iterated off-loop. ``captured_at`` is the single window anchor for
+        the payload (``paused_at`` frozen when paused); URLs, field shape,
+        and the ``hop=``/``focus=`` query contract are unchanged.
+        """
         session = manager.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="unknown session")
@@ -1099,8 +1107,9 @@ def _samples_csv(session) -> str:
     (does not stall the event loop).
 
     One header row followed by one row per sample, columns
-    ``timestamp_utc,timestamp_epoch,hop_index,ip,dns,rtt_ms``. ``rtt_ms`` is
-    empty for lost probes; ``ip``/``dns`` are empty for silent hops. The
+    ``timestamp_utc,timestamp_epoch,hop_index,ip,dns,rtt_ms,packet_lost``.
+    ``packet_lost`` is 1 for a lost probe and 0 for a reply; ``rtt_ms`` stays
+    empty for lost probes. ``ip``/``dns`` are empty for silent hops. The
     epoch column carries microsecond precision (fixed 6 decimals) so the
     text is deterministic and lexicographically sortable; the UTC column is
     ISO 8601 with a trailing ``Z``.
@@ -1121,7 +1130,15 @@ def _samples_csv_from_snapshot(
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow(
-        ["timestamp_utc", "timestamp_epoch", "hop_index", "ip", "dns", "rtt_ms"]
+        [
+            "timestamp_utc",
+            "timestamp_epoch",
+            "hop_index",
+            "ip",
+            "dns",
+            "rtt_ms",
+            "packet_lost",
+        ]
     )
     for t, hop_index, ip, dns, rtt_ms in rows:
         writer.writerow(
@@ -1132,6 +1149,7 @@ def _samples_csv_from_snapshot(
                 _safe_csv_text(ip),
                 _safe_csv_text(dns),
                 "" if rtt_ms is None else format(rtt_ms, ".3f"),
+                1 if rtt_ms is None else 0,
             ]
         )
     return out.getvalue()

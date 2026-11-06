@@ -5,8 +5,10 @@ A ``TraceSession`` owns:
 - a bounded ring buffer of target probe samples (always populated, even
   before route discovery completes — Slice 2 behaviour preserved),
 - a list of per-hop ``Hop`` entries once route discovery delivers them,
-- an asyncio task running the probe loop (target + every hop with a known IP,
-  concurrently),
+- an asyncio scheduler task that launches probe rounds on interval
+  deadlines (target + every hop with a known IP concurrently; rounds
+  overlap within bounded process/round budgets and commit in launch
+  order),
 - a background discovery task that runs ``traceroute`` once and then resolves
   hop names; failures degrade gracefully to target-only mode,
 - a fan-out of bounded SSE subscriber queues.
@@ -46,7 +48,8 @@ __all__ = [
     "DISCOVER_TIMEOUT_S",
     "HOP_SNAPSHOT_TAIL",
     "ICMP_NONRESPONSIVE_MIN_PROBES",
-    "MAX_CONCURRENT_PROBES",
+    "MAX_OUTSTANDING_PROBES",
+    "MAX_PENDING_ROUNDS",
     "MAX_SESSIONS",
     "PROBE_TIMEOUT_S",
     "ROLLUP_BUCKET_S",
@@ -59,6 +62,8 @@ __all__ = [
     "ProbeResult",
     "RollupBucket",
     "RoundEvent",
+    "RoundPlan",
+    "RoundPlanEntry",
     "RouteEvent",
     "Sample",
     "SessionLimitReached",
@@ -108,8 +113,29 @@ DISCOVER_TIMEOUT_S = 90.0
 # non-response). The destination is excluded: its 100% loss stays an error.
 ICMP_NONRESPONSIVE_MIN_PROBES = 5
 
-# Bound subprocess fan-out for unusually large routes.
-MAX_CONCURRENT_PROBES = 16
+# Session-owned probe budgets for PingPlotter-parity overlapping rounds.
+#
+# ``MAX_OUTSTANDING_PROBES`` bounds concurrently in-flight ping processes
+# per session. A permit is acquired when a round launches and held until
+# the engine's subprocess work — spawn, reply wait, kill, and reap — has
+# completed, so the budget counts real processes, not merely awaited
+# replies. 45 is a netplot policy inspired by the legacy Pingman
+# outstanding-request guidance, not a claim about current PingPlotter
+# defaults; with the eight-session cap total ping-process concurrency
+# stays bounded at 360 (excluding route discovery).
+#
+# ``MAX_PENDING_ROUNDS`` bounds launched-but-uncommitted rounds per
+# session, including rounds that finished probing but are waiting behind
+# an earlier round for launch-ordered commit.
+#
+# Admission is whole-round: a launch opportunity is taken only when its
+# complete known-host probe plan fits the remaining process budget AND the
+# pending-round count is below the cap. Otherwise the opportunity is
+# omitted and the next scheduled tick retries — no partial rounds, no
+# unbounded wait queue, and no fabricated loss samples for probes that
+# were never sent. The actual launch timestamps expose any resulting gap.
+MAX_OUTSTANDING_PROBES = 45
+MAX_PENDING_ROUNDS = 45
 
 # Maximum number of concurrent sessions the manager will hold at once.
 # PingPlotter-style multi-trace tabs (P1) bound the registry so a runaway
@@ -222,7 +248,11 @@ class Sample:
     """A single probe sample.
 
     ``rtt_ms`` is ``None`` for any failure mode (timeout, unreachable,
-    parse error). ``t`` is the epoch timestamp of the probe completion.
+    parse error). ``t`` is the epoch timestamp of the round LAUNCH (the
+    probe send time), matching the producer: the scheduler captures ``t``
+    when a round launches, so a reply arriving later — even after several
+    intervals but within its reply deadline — is still recorded at the
+    instant its probe was sent.
     """
 
     t: float
@@ -458,6 +488,84 @@ class RouteEvent:
 
 
 @dataclass(slots=True)
+class RoundPlanEntry:
+    """One probe destination inside an immutable round plan.
+
+    Captured at round launch so a discovery handoff cannot re-route an
+    in-flight round. ``host`` is the address to probe (``None`` for a
+    silent hop, which keeps its no-probe loss representation). ``hop`` is
+    the :class:`Hop` the sample and lifetime counters belong to (``None``
+    for the bare target stream). ``stream`` / ``rollup`` are the exact
+    deque/rollup objects the commit appends to — captured by identity so
+    discovery's final-hop==target rebinding (which points the new hop at
+    the session's target deque/rollup) stays consistent with rounds
+    launched before the handoff: both resolve to the same objects.
+    ``dispatched`` flips on the probe task's first step so cancellation
+    cleanup can distinguish a never-started probe (its permit is released
+    by the scheduler's cancel sweep) from one that releases its own permit
+    in its ``finally``.
+    """
+
+    hop_index: int
+    host: str | None
+    hop: Hop | None
+    stream: deque[Sample]
+    rollup: StreamRollup
+    dispatched: bool = False
+
+
+@dataclass(slots=True)
+class RoundPlan:
+    """Immutable probe plan for one round, captured at launch.
+
+    ``t`` is the epoch launch timestamp and becomes every committed
+    sample's ``t``; ``seq`` is the monotonically increasing launch-order
+    sequence that orders the launch-ordered commit. Entries snapshot the
+    hop list and stream identities at launch, so route discovery
+    completing mid-flight cannot mutate an outstanding round, duplicate
+    the target sample, or break the final-hop==target deque/rollup alias:
+    a pre-discovery round carries only the target entry and commits to the
+    target stream — the same object discovery rebinds as the final hop's
+    stream when the final hop equals the target.
+    """
+
+    seq: int
+    t: float
+    entries: list[RoundPlanEntry]
+
+
+class _ActiveRound:
+    """Scheduler-side handle for one launched round (worker-region internal).
+
+    ``plan`` is the immutable launch plan; ``probe_entries`` mirrors the
+    plan's known-host entries in task order so commit can zip results with
+    destinations; ``probe_tasks`` / ``collector`` are the round's owned
+    children; ``committed`` flips in :meth:`SessionManager._commit_round`
+    (a done-callback then retires the record from the scheduler's list);
+    ``collector_dispatched`` flips on the collector's first step so the
+    cancel sweep can distinguish a collector whose ``finally`` already
+    released the pending-round slot from one cancelled before it started.
+    """
+
+    __slots__ = (
+        "collector",
+        "collector_dispatched",
+        "committed",
+        "plan",
+        "probe_entries",
+        "probe_tasks",
+    )
+
+    def __init__(self, plan: RoundPlan) -> None:
+        self.plan = plan
+        self.probe_entries: list[RoundPlanEntry] = []
+        self.probe_tasks: list[asyncio.Task[float | None]] = []
+        self.collector: asyncio.Task[None] | None = None
+        self.collector_dispatched = False
+        self.committed = False
+
+
+@dataclass(slots=True)
 class TraceSession:
     """One target trace: probe loop + bounded sample history + subscribers."""
 
@@ -513,6 +621,18 @@ class TraceSession:
     _task: asyncio.Task[None] | None = None
     _discover_task: asyncio.Task[None] | None = None
     _discovery_restart: bool = False
+    # Scheduler budgets for overlapping rounds (PingPlotter-parity
+    # cadence). All three are touched only on the event loop by the
+    # scheduler and its lifecycle cleanup. ``_probe_permits`` counts
+    # in-flight ping processes, held from round launch through engine
+    # reaping (``MAX_OUTSTANDING_PROBES``); ``_pending_rounds`` counts
+    # launched-but-uncommitted rounds, including completed rounds waiting
+    # behind an earlier one for launch-ordered commit
+    # (``MAX_PENDING_ROUNDS``); ``_round_seq`` is the launch-order
+    # sequence used to order commits.
+    _probe_permits: int = 0
+    _pending_rounds: int = 0
+    _round_seq: int = 0
     _subscribers: set[asyncio.Queue] = field(default_factory=set)
     _closed: bool = False
     # Serialize lifecycle transitions and persistence compensation for one
@@ -534,17 +654,59 @@ class TraceSession:
         }
 
     def _window(
-        self, focus_s: float, samples: deque[Sample] | None = None
+        self,
+        focus_s: float,
+        samples: deque[Sample] | None = None,
+        end: float | None = None,
     ) -> list[Sample]:
-        """Return samples within ``focus_s`` seconds of now (0 = all).
+        """Return samples within ``focus_s`` seconds of ``end`` (0 = all).
 
         Operates on ``samples`` if given (per-hop), else on the target stream.
+        ``end`` is the window's right edge; ``None`` means "now". Snapshot
+        capture passes one shared anchor (``captured_at``) so every window,
+        stat, and cutoff inside a single payload is filtered against the
+        same instant. The right edge is hard: an explicit ``end`` excludes
+        samples newer than it (bounds inclusive on both sides) so a
+        future-dated record cannot influence stats or cutoffs past the
+        declared anchor. ``focus_s == 0`` with an explicit ``end`` keeps
+        every retained sample at/before that edge; without an explicit
+        ``end`` it keeps its ordinary all-retained-history semantics.
         """
         buf = self.samples if samples is None else samples
+        now = time.time() if end is None else end
         if focus_s and focus_s > 0:
-            cutoff = time.time() - focus_s
-            return [s for s in buf if s.t >= cutoff]
-        return list(buf)
+            cutoff = now - focus_s
+            return [s for s in buf if cutoff <= s.t <= now]
+        if end is None:
+            return list(buf)
+        return [s for s in buf if s.t <= end]
+
+    def _capture_anchor(self) -> float:
+        """Single effective epoch a snapshot's windows are anchored to.
+
+        ``time.time()`` for a running session; ``paused_at`` for a paused
+        one — frozen at the pause instant so a paused trace's window does
+        not keep sliding (and eventually empty) as wall-clock time passes.
+        Snapshot capture reads this once and derives every window, stat,
+        and cutoff in the payload from the same value.
+        """
+        if self.state == "paused" and self.paused_at is not None:
+            return self.paused_at
+        return time.time()
+
+    @staticmethod
+    def _cutoffs(window: list[Sample]) -> tuple[float | None, float | None]:
+        """``(sample_through_t, sample_from_t)`` extrema of one stats window.
+
+        Newest and oldest committed sample ``t`` in the exact window the
+        accompanying stats were computed over — losses included, since they
+        count in ``stats.count`` — or ``(None, None)`` when the window is
+        empty (no committed samples, no baseline to adopt).
+        """
+        if not window:
+            return None, None
+        ts = [s.t for s in window]
+        return max(ts), min(ts)
 
     @staticmethod
     def _stats_for(window: list[Sample]) -> dict:
@@ -622,9 +784,40 @@ class TraceSession:
         Top-level ``stats`` / ``samples`` always reflect the target's stream
         (which is the final hop's stream when route is ready and the final
         hop equals the target — they share the same deque reference).
+
+        Cutoff contract: ``captured_at`` is the single effective epoch this
+        payload was captured at and the right edge of EVERY window in it —
+        ``paused_at`` (frozen) for a paused session, otherwise the
+        capture-time ``time.time()``. ``sample_through_t`` /
+        ``sample_from_t`` are the extrema of the exact window that produced
+        the accompanying ``stats``, null when that window is empty. The
+        top-level trio describes the target stream; every ``hops[]`` entry
+        carries its own matching trio for its own stream. Capture must run
+        on the event loop with no intervening ``await`` so a concurrent
+        probe append cannot split stats from cutoffs.
         """
-        window = self._window(focus_s)
+        captured_at = self._capture_anchor()
+        window = self._window(focus_s, end=captured_at)
         tail = window[-SNAPSHOT_TAIL:]
+        through_t, from_t = self._cutoffs(window)
+        hops = []
+        for hop in self.hops:
+            # Each hop's cutoffs and stats come from ITS OWN window, filtered
+            # against the same captured_at anchor as the target's window.
+            hop_window = self._window(focus_s, hop.samples, end=captured_at)
+            hop_through, hop_from = self._cutoffs(hop_window)
+            hops.append(
+                {
+                    "index": hop.index,
+                    "ip": hop.ip,
+                    "dns": hop.dns,
+                    "icmp_non_responsive": self.hop_icmp_non_responsive(hop),
+                    "captured_at": captured_at,
+                    "sample_through_t": hop_through,
+                    "sample_from_t": hop_from,
+                    "stats": self._stats_for(hop_window),
+                }
+            )
         return {
             "id": self.id,
             "target": self.target,
@@ -636,16 +829,10 @@ class TraceSession:
             "focus_s": focus_s,
             "name": self.name,
             "persistent": self.persistent,
-            "hops": [
-                {
-                    "index": hop.index,
-                    "ip": hop.ip,
-                    "dns": hop.dns,
-                    "icmp_non_responsive": self.hop_icmp_non_responsive(hop),
-                    "stats": self._stats_for(self._window(focus_s, hop.samples)),
-                }
-                for hop in self.hops
-            ],
+            "captured_at": captured_at,
+            "sample_through_t": through_t,
+            "sample_from_t": from_t,
+            "hops": hops,
             "stats": self._stats_for(window),
             "samples": [{"t": s.t, "rtt_ms": s.rtt_ms} for s in tail],
         }
@@ -654,13 +841,18 @@ class TraceSession:
         """Per-hop snapshot for ``GET /api/traces/{id}/snapshot?hop=<index>``.
 
         Returns ``None`` when no hop has the requested index. Shape mirrors
-        :meth:`snapshot` but scoped to one hop.
+        :meth:`snapshot` but scoped to one hop, with the same cutoff
+        contract: ``captured_at`` anchors the window (``paused_at`` frozen
+        when paused), and ``sample_through_t`` / ``sample_from_t`` are the
+        extrema of this hop's exact stats window, null when empty.
         """
         hop = next((h for h in self.hops if h.index == hop_index), None)
         if hop is None:
             return None
-        window = self._window(focus_s, hop.samples)
+        captured_at = self._capture_anchor()
+        window = self._window(focus_s, hop.samples, end=captured_at)
         tail = window[-HOP_SNAPSHOT_TAIL:]
+        through_t, from_t = self._cutoffs(window)
         return {
             "id": self.id,
             "target": self.target,
@@ -669,6 +861,9 @@ class TraceSession:
             "dns": hop.dns,
             "icmp_non_responsive": self.hop_icmp_non_responsive(hop),
             "focus_s": focus_s,
+            "captured_at": captured_at,
+            "sample_through_t": through_t,
+            "sample_from_t": from_t,
             "stats": self._stats_for(window),
             "samples": [{"t": s.t, "rtt_ms": s.rtt_ms} for s in tail],
         }
@@ -1541,38 +1736,116 @@ class SessionManager:
     # ----------------------------------------------------------------- worker
 
     async def _run(self, session: TraceSession) -> None:
-        """Probe loop: probe every target concurrently at each interval."""
+        """Probe scheduler: launch rounds on monotonic interval deadlines.
+
+        The first round launches immediately on start/resume, then one
+        launch opportunity per ``interval_s`` deadline — independent of
+        probe completion, so a hop holding its full reply timeout cannot
+        delay the next launch (PingPlotter send-cadence parity). Rounds
+        overlap: collection, launch-ordered commit, and SSE publication
+        run in per-round collector tasks owned by this method.
+
+        Missed deadlines never produce catch-up bursts: after each wake-up
+        the deadline advances along its interval grid past ``now``, so at
+        most one round launches per tick even when the loop stalls. A
+        launch opportunity whose whole probe plan does not fit the
+        session's outstanding-process / pending-round budgets is omitted
+        (no partial rounds, no fake losses); the next tick retries.
+
+        This method owns every round it launched. On cancellation
+        (pause / delete / shutdown) the ``finally`` cancels and awaits the
+        collectors and probe tasks — which includes the engine's subprocess
+        kill + reap — so no canceled round can append, aggregate, or
+        publish after the lifecycle transition completes, and resume always
+        starts a single fresh scheduler generation.
+        """
+        loop = asyncio.get_running_loop()
+        rounds: list[_ActiveRound] = []
+        children: set[asyncio.Task[None]] = set()
+        # Launch-ordered commit chain: each collector awaits the previous
+        # round's commit event before committing. Local per generation, so
+        # a resumed session never inherits a stale chain from cancelled
+        # rounds of an earlier generation.
+        commit_chain = asyncio.Event()
+        commit_chain.set()
         try:
+            next_deadline = loop.time()
             while True:
-                start = time.monotonic()
-                await self._probe_round(session)
-                elapsed = time.monotonic() - start
-                sleep_for = session.interval_s - elapsed
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
+                commit_chain = self._launch_round(
+                    session, loop, rounds, children, commit_chain
+                )
+                now = loop.time()
+                # Advance to the next future deadline on the interval grid
+                # (no catch-up bursts for missed deadlines).
+                next_deadline += session.interval_s
+                while next_deadline <= now:
+                    next_deadline += session.interval_s
+                await asyncio.sleep(next_deadline - loop.time())
         except asyncio.CancelledError:
             # Pause / shutdown / delete — exit cleanly without raising.
-            return
+            pass
+        finally:
+            # Cancel collectors and probe tasks, then await them so engine
+            # reaping completes before this generation is reported dead.
+            for record in rounds:
+                if record.collector is not None and not record.collector.done():
+                    record.collector.cancel()
+                for task in record.probe_tasks:
+                    if not task.done():
+                        task.cancel()
+            if children:
+                # Done children were discarded via callback; cancelling a
+                # done task is a no-op, so this awaits exactly the live
+                # subtree. return_exceptions: cancelled probes surface as
+                # results, and a broken collector must not mask cleanup.
+                await asyncio.gather(*children, return_exceptions=True)
+            # Final accounting sweep, run only after every collector is
+            # dead so no commit or collector ``finally`` can race it:
+            # - probes whose tasks were cancelled before their first step
+            #   never ran their ``finally`` — release those permits here;
+            # - collectors cancelled before their first step never ran
+            #   their ``finally`` either — release those pending slots.
+            for record in rounds:
+                for entry in record.plan.entries:
+                    if entry.host is not None and not entry.dispatched:
+                        session._probe_permits -= 1
+                if not record.collector_dispatched:
+                    session._pending_rounds -= 1
 
-    async def _probe_round(self, session: TraceSession) -> None:
-        """Probe the target and every known hop concurrently; publish round.
+    def _launch_round(
+        self,
+        session: TraceSession,
+        loop: asyncio.AbstractEventLoop,
+        rounds: list[_ActiveRound],
+        children: set[asyncio.Task[None]],
+        commit_chain: asyncio.Event,
+    ) -> asyncio.Event:
+        """Admit and launch at most one round; return the next chain event.
 
-        Within one round all probes run in parallel via ``asyncio.gather`` —
-        the round duration is bounded by the slowest probe, not the sum. The
-        previous round fully completes before the next starts (the run loop
-        serializes rounds), so concurrent rounds never overlap even when the
-        configured interval is shorter than the probe duration.
+        Whole-round admission against the session budgets: the round
+        launches only when its complete known-host probe plan fits the
+        remaining outstanding-process budget AND the pending-round count
+        is below :data:`MAX_PENDING_ROUNDS`. Otherwise the launch
+        opportunity is omitted (the caller's next scheduled tick retries)
+        and the incoming ``commit_chain`` is returned unchanged — no
+        partial rounds, no unbounded waiting queue, no fabricated losses
+        for probes that were never sent.
+
+        Captures the immutable round plan — sequence, epoch launch
+        timestamp, hop identities, and the exact destination stream/rollup
+        objects — at launch, so route discovery completing while this
+        round is outstanding cannot re-route it or duplicate the target
+        sample. Must run on the event loop; contains no awaits or I/O.
         """
-        # Snapshot the hop list at the start of the round. If discovery
-        # completes mid-round, the new hops show up next round — simpler and
-        # avoids ordering surprises in the published event.
+        # Snapshot the hop list and stream identities at launch. A plan
+        # captured pre-discovery carries only the target entry; commit goes
+        # to the target stream, which discovery rebinds as the final hop's
+        # own stream when the final hop equals the target — the alias stays
+        # correct and the target sample is never duplicated.
         current_hops = list(session.hops)
-        timestamp = time.time()
 
-        # Decide whether the target is covered by the route's final hop. We
-        # only treat the FINAL hop as the target — an intermediate hop that
-        # happens to share the target's IP would not dedup (it would mean
-        # the route is malformed anyway).
+        # Only the FINAL hop counts as target-covered — an intermediate hop
+        # sharing the target's IP would not dedup (a malformed route).
         target_covered = (
             session.route_state == "ready"
             and session.target_ip is not None
@@ -1580,69 +1853,191 @@ class SessionManager:
             and current_hops[-1].ip == session.target_ip
         )
 
-        # Build the probe plan: list of (hop_index_or_0, host_or_None).
-        # Silent hops (ip=None) are NOT probed but still appear in the round
-        # event with rtt_ms=None so subscribers can record loss samples.
-        plan: list[tuple[int, str | None]] = []
+        entries: list[RoundPlanEntry] = []
         for hop in current_hops:
-            plan.append((hop.index, hop.ip))
-        if not target_covered:
-            plan.append((0, session.target))
-
-        # Probe every hop with a known host concurrently.
-        to_probe = [(idx, host) for idx, host in plan if host is not None]
-        if to_probe:
-            results: list[float | None] = []
-            for offset in range(0, len(to_probe), MAX_CONCURRENT_PROBES):
-                batch = to_probe[offset : offset + MAX_CONCURRENT_PROBES]
-                results.extend(
-                    await asyncio.gather(
-                        *(
-                            self._probe_fn(host, self._probe_timeout_s)
-                            for _, host in batch
-                        )
-                    )
+            entries.append(
+                RoundPlanEntry(
+                    hop_index=hop.index,
+                    host=hop.ip,
+                    hop=hop,
+                    stream=hop.samples,
+                    rollup=hop.rollup,
                 )
-            probe_by_idx = {idx: rtt for (idx, _), rtt in zip(to_probe, results)}
-        else:
-            probe_by_idx = {}
+            )
+        if not target_covered:
+            entries.append(
+                RoundPlanEntry(
+                    hop_index=0,
+                    host=session.target,
+                    hop=None,
+                    stream=session.samples,
+                    rollup=session.target_rollup,
+                )
+            )
 
-        # Append per-hop samples. The order is deterministic by hop index.
-        # Slice D2 — the SAME sample is folded into the stream's rollup in
-        # the same on-loop turn (no await between the deque append and the
-        # rollup fold), so a concurrent history/buckets read cannot observe
-        # a half-updated state. The rollup is bounded independent of the
-        # probe interval; the raw deque stays the D1 retention cap.
-        for idx, host in plan:
-            if idx == 0:
-                # Target stream. Always append (this is the Slice 2 stream).
-                target_rtt = probe_by_idx.get(idx)
-                session.samples.append(Sample(t=timestamp, rtt_ms=target_rtt))
-                session.target_rollup.add_sample(timestamp, target_rtt)
-                continue
-            hop = next((h for h in current_hops if h.index == idx), None)
-            if hop is None:
-                continue
-            # Silent hops (host is None) get a loss sample.
-            rtt = probe_by_idx.get(idx) if host is not None else None
-            hop.samples.append(Sample(t=timestamp, rtt_ms=rtt))
-            hop.rollup.add_sample(timestamp, rtt)
-            # Lifetime counters for the ICMP non-responsive classification.
-            # Same on-loop turn as the sample append; the classification is
-            # recomputed on read so it flips back the moment a reply lands.
-            hop.probes += 1
-            if rtt is not None:
-                hop.replies += 1
+        probes = [entry for entry in entries if entry.host is not None]
+        # Whole-round admission. Silent hops keep their no-probe
+        # representation and do not consume budget.
+        if session._probe_permits + len(probes) > MAX_OUTSTANDING_PROBES:
+            return commit_chain
+        if session._pending_rounds >= MAX_PENDING_ROUNDS:
+            return commit_chain
 
-        # Build the per-round event in hop-index order. hop=0 (target) sorts
-        # before hop>=1 when present.
+        record = _ActiveRound(
+            RoundPlan(seq=session._round_seq, t=time.time(), entries=entries)
+        )
+        record.probe_entries = probes
+        session._round_seq += 1
+        session._pending_rounds += 1
+        rounds.append(record)
+
+        for entry in probes:
+            # The permit is acquired here (synchronously, on-loop) and
+            # held through engine spawn/wait/kill/reap: released by the
+            # probe task's ``finally`` when it started running, or by the
+            # cancel sweep in :meth:`_run`'s ``finally`` when cancellation
+            # hit before the task's first step.
+            session._probe_permits += 1
+            task = loop.create_task(self._probe_one(session, entry))
+            record.probe_tasks.append(task)
+            children.add(task)
+            task.add_done_callback(children.discard)
+
+        # Launch-ordered commit: this round waits for its predecessor's
+        # commit event; later rounds wait for this round's.
+        prev_committed = commit_chain
+        committed = asyncio.Event()
+        record.collector = loop.create_task(
+            self._collect_round(session, record, prev_committed, committed)
+        )
+        children.add(record.collector)
+        record.collector.add_done_callback(children.discard)
+
+        def _retire(_task: asyncio.Task[None]) -> None:
+            # Committed rounds are fully accounted (samples appended once,
+            # pending slot released by the collector's finally, permits by
+            # the probe finallys) — drop the handle so the scheduler's
+            # record list stays bounded over a long-lived session.
+            if record.committed:
+                rounds.remove(record)
+
+        record.collector.add_done_callback(_retire)
+        return committed
+
+    async def _probe_one(
+        self, session: TraceSession, entry: RoundPlanEntry
+    ) -> float | None:
+        """Run one probe with the session's reply timeout and permit held.
+
+        The 3-second reply allowance is the protocol window only — the
+        permit additionally covers engine spawn, the reply-wait watchdog,
+        kill, and reap, so the outstanding-process budget counts real ping
+        processes. ``dispatched`` flips before the first await: if a
+        lifecycle cancellation lands before this task's first step the
+        ``finally`` never runs, and :meth:`_run`'s sweep releases the
+        permit instead.
+        """
+        entry.dispatched = True
+        try:
+            return await self._probe_fn(entry.host, self._probe_timeout_s)
+        finally:
+            session._probe_permits -= 1
+
+    async def _collect_round(
+        self,
+        session: TraceSession,
+        record: _ActiveRound,
+        prev_committed: asyncio.Event,
+        committed: asyncio.Event,
+    ) -> None:
+        """Collect one round's replies asynchronously, commit in launch order.
+
+        Replies are awaited past the interval: a response taking longer
+        than the configured interval but less than its reply deadline is a
+        success, and pending work is never recorded as a loss. The commit
+        waits for the previous round's commit event, so history, rollups,
+        and the SSE feed stay launch-ordered with no duplicates even when
+        a later round finishes first. Cancellation discards the round
+        uncommitted — no partial writes, no false losses.
+
+        The collector's ``finally`` releases the pending-round slot for
+        every round it started, whichever way it ends (commit, discard on
+        broken probe_fn, or cancellation); the cancel sweep in
+        :meth:`SessionManager._run` releases the slot only for collectors
+        cancelled before their first step.
+        """
+        record.collector_dispatched = True
+        try:
+            results = await asyncio.gather(*record.probe_tasks)
+            await prev_committed.wait()
+            self._commit_round(session, record, results)
+            committed.set()
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            # Discard the round like a cancellation: uncommitted, no
+            # fabricated samples. Log instead of killing the scheduler —
+            # probe_fn never raises in production (probe_once normalizes
+            # everything), so this only guards injected/test fakes.
+            log.exception(
+                "netplot: session %s discarded round %d after collection error",
+                session.id,
+                record.plan.seq,
+            )
+        finally:
+            session._pending_rounds -= 1
+
+    def _commit_round(
+        self,
+        session: TraceSession,
+        record: _ActiveRound,
+        results: list[float | None],
+    ) -> None:
+        """Append one round's samples exactly once, in launch order.
+
+        Runs synchronously on the event loop with no awaits: the deque
+        appends, rollup folds, lifetime counters, and the SSE round-event
+        publish are one atomic step, so a concurrent read can never
+        observe a half-committed round and a cancellation can never
+        interrupt one mid-write. ``results`` align with
+        ``record.probe_tasks`` (gather preserves task order, which follows
+        ``plan.entries`` order).
+        """
+        timestamp = record.plan.t
+        rtt_by_index = {
+            entry.hop_index: rtt
+            for entry, rtt in zip(record.probe_entries, results)
+            if entry.host is not None
+        }
+        # Per-stream appends in plan order (hops, then the target entry
+        # when present). Slice D2 — the SAME sample is folded into the
+        # stream's rollup in this same on-loop turn (no await between the
+        # deque append and the rollup fold). Silent hops (host is None)
+        # keep their loss-sample representation.
+        for entry in record.plan.entries:
+            rtt = rtt_by_index.get(entry.hop_index) if entry.host is not None else None
+            entry.stream.append(Sample(t=timestamp, rtt_ms=rtt))
+            entry.rollup.add_sample(timestamp, rtt)
+            if entry.hop is not None:
+                # Lifetime counters for the ICMP non-responsive
+                # classification; recomputed on read so the flag flips
+                # back the moment a reply lands.
+                entry.hop.probes += 1
+                if rtt is not None:
+                    entry.hop.replies += 1
+
+        # Per-round SSE event in hop-index order (hop=0 sorts before >=1).
         results_event = [
             ProbeResult(
-                hop=idx, rtt_ms=probe_by_idx.get(idx) if host is not None else None
+                hop=entry.hop_index,
+                rtt_ms=rtt_by_index.get(entry.hop_index)
+                if entry.host is not None
+                else None,
             )
-            for idx, host in plan
+            for entry in record.plan.entries
         ]
         results_event.sort(key=lambda r: r.hop)
+        record.committed = True
         session.append_round(timestamp, results_event)
 
     async def _discover(self, session: TraceSession) -> None:

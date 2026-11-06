@@ -22,7 +22,9 @@ import asyncio
 import json
 import os
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -38,6 +40,7 @@ from netplot.persistence import (
 )
 from netplot.session import (
     MAX_SESSIONS,
+    RoundEvent,
     SessionManager,
     TraceSession,
 )
@@ -2210,3 +2213,312 @@ def test_sanitize_name_strips_unpaired_surrogates() -> None:
         assert chr(code) not in cleaned
         # Must not crash on encode.
         cleaned.encode("utf-8")
+
+
+# ============================================================== lifecycle rollback with overlapping rounds
+#
+# Persistence failure injected at the store's atomic-swap boundary
+# (netplot.persistence.os.replace — the same module-attribute convention the
+# fsync tests use) while the scheduler owns genuinely overlapping unfinished
+# work: early dispatches complete and commit, then one old-generation
+# dispatch blocks outstanding while later rounds are launched behind it.
+# Launch-ordered commit means nothing commits past a blocked head, so those
+# later rounds stay uncommitted — that pending overlap is exactly what the
+# rollback must cancel. A failed persistent pause/delete must roll back to
+# the prior registered/running state, cancel the old generation's
+# outstanding probes (their results are discarded, never appended as
+# samples or recorded as losses), and leave exactly the fresh generation
+# dispatching; the healed retry must leave zero active probes and stable
+# history.
+
+
+async def _wait_for_round_events(queue: asyncio.Queue, n: int) -> None:
+    """Drain a subscriber queue until ``n`` further committed rounds arrive.
+
+    Waits on observed dispatch (one RoundEvent per committed round) instead
+    of sleeping. ``n`` is the increment for THIS call; the helper keeps no
+    accumulated state, so callers track their own totals.
+    """
+    seen = 0
+    while seen < n:
+        event = await asyncio.wait_for(queue.get(), timeout=5.0)
+        if isinstance(event, RoundEvent):
+            seen += 1
+
+
+def _overlap_probe_factory() -> SimpleNamespace:
+    """Probe fake whose dispatch phases gate a real overlapping scenario.
+
+    Generation identity rides on the return values: dispatches 1-3 and
+    every fresh-generation dispatch return an ordinary 1.0 reply, while
+    dispatch 4 — the old generation's next round — would return the
+    sentinel 99.0 once released. Any committed 99.0 sample after the
+    rollback therefore identifies a leaked old-generation collector, and
+    any ``None`` (loss) sample is fabricated — no probe here ever times
+    out. Gates exposed on the returned namespace:
+
+    - ``blocked_started``: dispatch 4 is blocked outstanding (its round
+      holds a probe permit);
+    - ``overlap_started``: a later round has been launched behind the
+      blocked head (holding a pending slot that launch-ordered commit will
+      not release until the head commits — the unfinished overlap);
+    - ``release``: set by the test to let the blocked dispatch return.
+    """
+    release = asyncio.Event()
+    blocked_started = asyncio.Event()
+    overlap_started = asyncio.Event()
+    dispatches = 0
+
+    async def probe(_host: str, _timeout_s: float) -> float | None:
+        nonlocal dispatches
+        dispatches += 1
+        if dispatches <= 3:
+            return 1.0
+        if dispatches == 4:
+            blocked_started.set()
+            await release.wait()
+            return 99.0
+        overlap_started.set()
+        return 1.0
+
+    return SimpleNamespace(
+        release=release,
+        blocked_started=blocked_started,
+        overlap_started=overlap_started,
+        probe=probe,
+    )
+
+
+async def _mutate_pause(mgr: SessionManager, session: TraceSession) -> None:
+    await mgr.pause(session)
+
+
+async def _mutate_delete(mgr: SessionManager, session: TraceSession) -> None:
+    await mgr.delete(session)
+
+
+async def _rollback_after_failed_persistent_write(
+    tmp_path: Path,
+    mutate: Callable[[SessionManager, TraceSession], Awaitable[None]],
+    with_keeper: bool,
+) -> tuple[
+    PersistentStore,
+    SessionManager,
+    TraceSession,
+    TraceSession | None,
+    asyncio.Queue,
+]:
+    """Run the shared failed-persistent-write scenario up to the healed retry.
+
+    ``mutate`` (pause or delete) runs while the store's atomic swap raises
+    OSError, with the probe fake's gates proving the overlap: three
+    committed rounds, one blocked old-generation dispatch outstanding, and
+    at least one further round unfinished behind it. Asserts the rollback
+    contract common to pause and delete — the durable row-0 running
+    definition survived, the registry entry is restored, the lifecycle is
+    running with a genuinely fresh (not resumed) scheduler generation, and
+    the dead generation left no residue: releasing the blocked dispatch
+    must not append the 99.0 sentinel or any fabricated loss while the
+    fresh generation commits ordinary rounds. The restarted scheduler
+    legitimately owns live probes, so permits/pending are NOT asserted
+    zero here — each test asserts that only after its healed retry.
+
+    Returns the store, manager, rolled-back session, optional keeper
+    session, and the session's subscriber queue for the transition-specific
+    assertions.
+    """
+    import netplot.persistence as pmod
+
+    store = PersistentStore(tmp_path)
+    gates = _overlap_probe_factory()
+    mgr = SessionManager(
+        probe_fn=gates.probe,
+        discover_fn=_failing_discover,
+        resolve_name_fn=_fast_resolve_name,
+        persistence=store,
+    )
+    try:
+        session = mgr.create("example.com", interval_s=1.0, persistent=True)
+        keeper = (
+            mgr.create("keeper.example", persistent=True) if with_keeper else None
+        )
+        queue = session.subscribe()
+        await mgr.start(session)
+        old_task = session._task
+
+        # Completion gate: the first three dispatches return immediately, so
+        # exactly rounds 1-3 commit in launch order and publish. The blocked
+        # head cannot commit, so nothing else can be sampled or queued.
+        await _wait_for_round_events(queue, 3)
+        assert len(session.samples) == 3
+        assert all(s.rtt_ms == 1.0 for s in session.samples)
+        assert queue.empty()
+        assert session.state == "running"
+
+        # Dispatch gate: the fourth dispatch is blocked outstanding and a
+        # fifth round has been launched behind it — real overlapping
+        # unfinished work, not committed events behind a blocked head.
+        await asyncio.wait_for(gates.blocked_started.wait(), 5.0)
+        await asyncio.wait_for(gates.overlap_started.wait(), 5.0)
+        assert session._probe_permits >= 1
+        assert session._pending_rounds >= 2
+
+        # Fail the durable write after the tmp file is written but before
+        # the atomic swap: sessions.json must still hold the create-time
+        # "running" definition.
+        real_replace = pmod.os.replace
+
+        def failing_replace(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated atomic swap failure")
+
+        pmod.os.replace = failing_replace
+        try:
+            with pytest.raises(OSError):
+                await mutate(mgr, session)
+        finally:
+            pmod.os.replace = real_replace
+
+        # Durable state: row 0 is still the prior registered/running
+        # definition. Registry + in-memory lifecycle: restored to running,
+        # not stuck mid-transition, and the restarted scheduler is a new
+        # generation — the old task is done and awaited, a live task
+        # replaced it.
+        entries = store.read().entries
+        assert entries[0]["id"] == session.id
+        assert entries[0]["desired_state"] == "running"
+        assert mgr.get(session.id) is session
+        assert session.state == "running"
+        assert session.paused_at is None
+        assert old_task is not None and old_task.done()
+        assert session._task is not None
+        assert session._task is not old_task
+        assert not session._task.done()
+
+        # Old generation must be gone: release the blocked probe. Its
+        # collector was cancelled with the old generation, so the 99.0
+        # sentinel is discarded uncommitted — a leaked old-generation
+        # collector would append it, and a fabricated loss would surface as
+        # rtt_ms None. The fresh generation keeps committing ordinary 1.0
+        # rounds.
+        gates.release.set()
+        await _wait_for_round_events(queue, 2)
+        assert len(session.samples) >= 5
+        assert all(s.rtt_ms == 1.0 for s in session.samples)
+        assert session.state == "running"
+
+        return store, mgr, session, keeper, queue
+    except BaseException:
+        # A failed scenario (gate timeout, assertion) must not leak a live
+        # scheduler into the closing event loop.
+        await mgr.shutdown()
+        raise
+
+
+def test_failed_persistent_pause_restores_running_with_fresh_generation(
+    tmp_path: Path,
+) -> None:
+    """A pause whose durable write fails rolls back to the prior running
+    state while overlapping rounds are outstanding.
+
+    The failing pause must keep the session registered and running in BOTH
+    memory and the state file (desired_state=running) with a fresh
+    scheduler generation, and must discard the old generation's blocked
+    round: no 99.0 sentinel sample and no fabricated loss. A subsequent
+    successful pause records the paused desired state, stops all probes
+    (zero permits and pending slots), and freezes history; shutdown then
+    closes the session with history intact.
+    """
+
+    async def run() -> None:
+        scenario = await _rollback_after_failed_persistent_write(
+            tmp_path, _mutate_pause, with_keeper=False
+        )
+        store, mgr, session, _keeper, queue = scenario
+        try:
+            # Only the rolled-back session's row is durable.
+            assert len(store.read().entries) == 1
+
+            # Healed store: the subsequent pause succeeds durably and stops
+            # the fresh generation. The session stream itself stays open —
+            # pause is not a close.
+            await mgr.pause(session)
+            assert session.state == "paused"
+            assert session.paused_at is not None
+            assert session._closed is False
+            assert store.read().entries[0]["desired_state"] == "paused"
+            assert session._task is None
+            # Every probe the fresh generation had launched is reaped with
+            # it: zero active probes.
+            assert session._probe_permits == 0
+            assert session._pending_rounds == 0
+            # No active probes → history stable: freeze contents, then hold
+            # briefly to catch any already-scheduled leaked writer. The old
+            # generation's sentinel never appears and nothing was recorded
+            # as a loss.
+            frozen = [(s.t, s.rtt_ms) for s in session.samples]
+            assert len(frozen) >= 5
+            assert all(rtt == 1.0 for _, rtt in frozen)
+            frozen_events = queue.qsize()
+            await asyncio.sleep(0.15)
+            assert [(s.t, s.rtt_ms) for s in session.samples] == frozen
+            assert queue.qsize() == frozen_events
+        finally:
+            # Cleans up even if an assertion above fails; on the success
+            # path this doubles as the shutdown-under-test.
+            await mgr.shutdown()
+
+        # Shutdown closes the session; history remains intact.
+        assert session._closed is True
+        assert [(s.t, s.rtt_ms) for s in session.samples] == frozen
+
+    asyncio.run(run())
+
+
+def test_failed_persistent_delete_restores_running_session(tmp_path: Path) -> None:
+    """A delete whose durable write fails restores the registered running
+    session (fresh generation; the canceled old generation left no residue
+    — the shared scenario proves the blocked sentinel round was discarded);
+    a later successful delete removes the session durably, keeps the
+    keeper row, and leaves zero active probes with history frozen.
+
+    A second persistent session keeps the write path on the atomic swap:
+    deleting the last persistent session would go through ``store.remove``
+    (plain unlink), which is a different durability transition.
+    """
+
+    async def run() -> None:
+        scenario = await _rollback_after_failed_persistent_write(
+            tmp_path, _mutate_delete, with_keeper=True
+        )
+        store, mgr, session, keeper, _queue = scenario
+        assert keeper is not None
+        try:
+            # Both rows survive the failed delete, the deleted one still
+            # running, in original registration order.
+            entries = store.read().entries
+            assert [e["id"] for e in entries] == [session.id, keeper.id]
+
+            # Healed store: the subsequent delete succeeds durably and
+            # leaves only the keeper behind.
+            await mgr.delete(session)
+            assert mgr.get(session.id) is None
+            assert mgr.get(keeper.id) is keeper
+            assert [e["id"] for e in store.read().entries] == [keeper.id]
+            # Zero active probes: the subscriber stream is closed with the
+            # session, the scheduler is gone, and every probe was reaped.
+            assert session._closed is True
+            assert session._task is None
+            assert session._probe_permits == 0
+            assert session._pending_rounds == 0
+            # History is frozen at the committed set — the canceled blocked
+            # round never appended (no 99.0 sentinel, no fabricated losses).
+            frozen = [(s.t, s.rtt_ms) for s in session.samples]
+            assert len(frozen) >= 5
+            assert all(rtt == 1.0 for _, rtt in frozen)
+            await asyncio.sleep(0.15)
+            assert [(s.t, s.rtt_ms) for s in session.samples] == frozen
+        finally:
+            # Cleans up even if an assertion above fails.
+            await mgr.shutdown()
+
+    asyncio.run(run())

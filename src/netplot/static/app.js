@@ -740,16 +740,14 @@
     },
 
     /**
-     * Snapshot baseline expiry for a given focus window: last sample t + focusS.
-     * Returns undefined for an empty snapshot (the caller falls back to the
-     * receipt time). Used by the seed-baseline path so the dropdown-selected
-     * window drives when the live-only path takes over.
+     * Snapshot baseline aging has no client-side expiry timer: validity
+     * derives from the adopted payload's own window extrema (see
+     * PURE.statsForHopWindow). The aggregate stays reusable only while its
+     * OLDEST sample (``sample_from_t``) is still at/after the selected
+     * window start. Paused traces freeze ``captured_at`` at the pause
+     * instant and stop producing samples, so a paused baseline's oldest
+     * sample never crosses the frozen window start and stays valid.
      */
-    snapshotExpiry: function (samples, focusS) {
-      if (!samples || samples.length === 0) return undefined;
-      var f = focusS > 0 ? focusS : FOCUS_S;
-      return samples[samples.length - 1].t + f;
-    },
 
     FOCUS_S: FOCUS_S,
     FOCUS_OPTIONS: FOCUS_OPTIONS,
@@ -1025,15 +1023,6 @@
     while (list.length > RAW_CAP) list.shift();
   };
 
-  // A snapshot watermark is meaningful only when the payload represents at
-  // least one sample.  In particular, do not use the client receipt time for
-  // an empty snapshot: an SSE sample produced between the snapshot response
-  // and EventSource attachment could otherwise be discarded.
-  PURE.snapshotWatermark = function (samples) {
-    if (!samples || samples.length === 0) return undefined;
-    return samples[samples.length - 1].t;
-  };
-
   // Keep expiry logic in the same time domain as sample retention.  This is
   // also used by the timer path, where no new round may arrive to trigger a
   // table render.
@@ -1041,55 +1030,302 @@
     return !!focus && focus.endS < nowS - RETENTION_S;
   };
 
+  /**
+   * The stats-window width the server actually used for a snapshot payload:
+   * the echoed ``focus_s``, preserved EXACTLY. 0 is a real echo — the
+   * HTTP-only "all retained" window (the Focus dropdown offers no zero
+   * option, but snapshot requests do) — and must stay distinct from every
+   * positive width: a baseline computed over all retained samples matches
+   * only a zero-width query downstream (``seedFocus`` equality in
+   * PURE.statsForHopWindow) and is suspended for the selected UI window.
+   * A missing or malformed echo (non-number, NaN/±Infinity, negative) is
+   * NEVER substituted with the currently selected window: it returns null
+   * so adoption rejects the baseline outright instead of mislabeling the
+   * aggregate's window.
+   */
+  PURE.snapshotFocusSeconds = function (snap) {
+    var f = snap && snap.focus_s;
+    return typeof f === "number" && isFinite(f) && f >= 0 ? f : null;
+  };
+
+  /**
+   * Adopt one server snapshot baseline into per-stream accounting state.
+   *
+   * ``key`` is the stream's hop key ("0" for the target stream, the route
+   * hop index otherwise). ``stats`` is the snapshot's window aggregate for
+   * that stream; ``capS`` is the payload's ``captured_at`` — the single
+   * effective epoch reference the server captured the whole snapshot at
+   * (running captures use the server's now; a paused trace freezes it at
+   * ``paused_at``, so every paused snapshot carries the same value).
+   * ``throughT`` is the payload's ``sample_through_t`` and ``fromT`` its
+   * ``sample_from_t`` — the latest and oldest committed sample timestamps
+   * inside the SAME immutable stats window that produced ``stats`` (both
+   * null for an empty stream). ``focusS`` is the stats-window width the
+   * server actually used (the echoed ``focus_s``, preserved exactly — 0 is
+   * the HTTP-only "all retained" window, never rewritten to the selected
+   * width).
+   *
+   * Returns true when the payload was adopted (including the explicit
+   * empty-stream clear), false when it was rejected.
+   *
+   * Rejection rules:
+   *  - A payload without a finite ``captured_at`` is unusable: baseline
+   *    aging must never fall back to the client receipt time or the latest
+   *    local sample.
+   *  - A payload without a finite, non-negative ``focusS`` is unusable:
+   *    the echoed width identifies the window the aggregate was computed
+   *    over, and substituting the selected width would mislabel it.
+   *  - A NONEMPTY payload without a finite ``sample_from_t`` is unusable:
+   *    validity is bounded by the aggregate's oldest sample, and inventing
+   *    it client-side (e.g. from the theoretical window start) would
+   *    fabricate coverage the server never reported.
+   *  - A strictly OLDER ``captured_at`` than the latest snapshot seen for
+   *    the stream is stale (an older snapshot response arriving after a
+   *    newer one): the newer baseline and the live samples pushed past its
+   *    cutoff stay untouched. Equal ``captured_at`` values adopt (paused
+   *    snapshots and same-instant top-level/per-hop fetches).
+   *
+   * An EMPTY stream (count 0 or null cutoff) clears the stream's baseline,
+   * cutoff, oldest-sample anchor, and watermark outright instead of leaving
+   * a stale aggregate behind — but RETAINS the capture marker (``seedCap``
+   * moves to this payload's ``captured_at``): adoption is monotonic in the
+   * latest snapshot seen per stream, so an older nonempty payload arriving
+   * after a newer EMPTY one cannot resurrect a stale aggregate. Equal
+   * frozen paused captures still adopt. A non-empty payload records the
+   * strict-after delta cutoff (``seedCut`` = ``sample_through_t``), the
+   * aging anchor (``seedFrom`` = ``sample_from_t``), the capture marker
+   * (``seedCap``), the window width the aggregate was computed with
+   * (``seedFocus``), and the SSE dedup watermark (``seedWatermark`` =
+   * ``sample_through_t``).
+   *
+   * Aging consumes ``sample_from_t`` (not ``captured_at`` + width): the
+   * aggregate counts exactly the window's [from .. through] samples, so it
+   * is reusable in a later selected window only while its oldest sample is
+   * still at/after that window's start (see PURE.statsForHopWindow).
+   */
+  PURE.adoptSnapshotBaseline = function (sampleState, key, stats, capS, throughT, fromT, focusS) {
+    var st = sampleState || {};
+    if (typeof capS !== "number" || !isFinite(capS)) return false;
+    // The echoed window width is part of the payload's identity. A missing
+    // or malformed ``focusS`` cannot be substituted with the selected
+    // window (the aggregate would be mislabeled), so the payload is
+    // rejected outright — including an EMPTY payload, whose clear may only
+    // apply to the width it was actually fetched for. Zero is valid and
+    // distinct (the all-retained window); negative widths are invalid.
+    if (typeof focusS !== "number" || !isFinite(focusS) || focusS < 0) return false;
+    var prevCap = (st.seedCap || {})[key];
+    if (typeof prevCap === "number" && isFinite(prevCap) && capS < prevCap) return false;
+    if (!stats || !(stats.count > 0) ||
+        typeof throughT !== "number" || !isFinite(throughT)) {
+      ["seedStats", "seedCut", "seedFrom", "seedFocus", "seedWatermark"]
+        .forEach(function (m) { if (st[m]) delete st[m][key]; });
+      st.seedCap = st.seedCap || {};
+      st.seedCap[key] = capS;
+      return true;
+    }
+    // A nonempty payload without its oldest-sample timestamp cannot be aged
+    // correctly (validity is bounded by sample_from_t, not the theoretical
+    // window start): reject it rather than invent coverage client-side.
+    if (typeof fromT !== "number" || !isFinite(fromT)) return false;
+    st.seedStats = st.seedStats || {};
+    st.seedCut = st.seedCut || {};
+    st.seedCap = st.seedCap || {};
+    st.seedFrom = st.seedFrom || {};
+    st.seedFocus = st.seedFocus || {};
+    st.seedWatermark = st.seedWatermark || {};
+    st.seedStats[key] = stats;
+    st.seedCut[key] = throughT;
+    st.seedCap[key] = capS;
+    st.seedFrom[key] = fromT;
+    st.seedFocus[key] = focusS;
+    st.seedWatermark[key] = throughT;
+    return true;
+  };
+
+  /**
+   * Record that the client's raw sample buffer for ``key`` is a complete
+   * census of the server's samples from ``startS`` forward (a stats-window
+   * history backfill was adopted; live SSE keeps it current until the
+   * transport drops, which resets coverage). Coverage only ever extends
+   * earlier: the minimum of the adopted window starts.
+   */
+  PURE.extendCoverage = function (sampleState, key, startS) {
+    var st = sampleState || {};
+    st.covFrom = st.covFrom || {};
+    var cov = st.covFrom[key];
+    st.covFrom[key] = typeof cov === "number" && cov < startS ? cov : startS;
+    return st.covFrom[key];
+  };
+
+  /**
+   * Release a coverage backfill's in-flight marker ONLY when the completing
+   * request still owns it. Every coverage request stores a unique ownership
+   * token in ``covInFlight[key]`` when it starts; a stale request's
+   * completion (its token wiped by a transport break/reconnect/reset, or
+   * replaced by a newer generation's backfill for the same stream) must not
+   * release the newer request's marker — otherwise an old focus/reset
+   * response could unlock a duplicate backfill while the current one is
+   * still outstanding. Returns true when the caller owned and released the
+   * marker.
+   */
+  PURE.releaseCoverageInFlight = function (sampleState, key, token) {
+    var st = sampleState || {};
+    if (!st.covInFlight || st.covInFlight[key] !== token) return false;
+    st.covInFlight[key] = false;
+    return true;
+  };
+
+  /**
+   * Advance the per-tab connection-continuity generation and drop every
+   * raw-coverage claim immediately. Called when the SSE transport breaks
+   * (error) and again when it reconnects (ready): samples arriving while
+   * the stream is down are missed, so no completeness claim may survive
+   * the break, and in-flight backfills issued before the break must be
+   * fenced from re-establishing coverage across the gap. Wiping
+   * ``covInFlight`` also strips the old requests' ownership: their
+   * completions release nothing, so they can never unlock or clobber a
+   * newer generation's backfill. Returns the new generation.
+   */
+  PURE.breakCoverageContinuity = function (sampleState) {
+    var st = sampleState || {};
+    st.covFrom = {};
+    st.covInFlight = {};
+    st.covConnected = false;
+    st.covGen = (typeof st.covGen === "number" ? st.covGen : 0) + 1;
+    return st.covGen;
+  };
+
+  /**
+   * Extend coverage ONLY while the SSE transport is connected and the
+   * completing backfill belongs to the current connection generation.
+   * A request issued during an outage cannot prove ongoing coverage.
+   * A response that crossed a transport break/reconnect may still merge raw
+   * rows upstream (the merge is idempotent and safe), but it must NEVER
+   * establish completeness: its fetched window cannot include samples the
+   * server recorded while the stream was down, so a claim from it would
+   * present a gap as full coverage. Returns the (possibly unchanged) claim.
+   */
+  PURE.extendCoverageIfCurrent = function (sampleState, key, startS, capturedGen, currentGen) {
+    if (!sampleState || !sampleState.covConnected || capturedGen !== currentGen) {
+      return ((sampleState || {}).covFrom || {})[key];
+    }
+    return PURE.extendCoverage(sampleState, key, startS);
+  };
+
   PURE.statsForHopWindow = function (sampleState, hopIndex, nowS, focusS) {
     var key = String(hopIndex);
-    var list = sampleState.samples[key];
-    var live = PURE.computeStatsWindow(list || [], nowS, focusS);
-    var seed = sampleState.seedStats[key];
-    var baselineLive = sampleState.seedUntil[key] === undefined || nowS <= sampleState.seedUntil[key];
-    if (live && live.count > 0 && seed && baselineLive) {
-      // The backend snapshot supplies the accumulated baseline, while the
-      // browser owns only the post-snapshot delta. Combine them rather than
-      // replacing the baseline with one newly arrived sample.
-      var seedSuccess = seed.count * (1 - (seed.loss_pct || 0) / 100);
-      var liveSuccess = live.count * (1 - live.lossPct / 100);
-      var totalSuccess = seedSuccess + liveSuccess;
-      // Snapshot stats historically ship without max_ms. Whisker rendering
-      // needs min AND max, so take whichever seed value is present (future
-      // snapshots) and merge with the live max; if both are absent, max
-      // stays null and the renderer degrades to markers-only (no whisker).
-      var seedMax = seed.max_ms;
-      var combinedMax;
-      if (seedMax !== null && seedMax !== undefined && !isNaN(seedMax) &&
-          live.max !== null && live.max !== undefined && !isNaN(live.max)) {
-        combinedMax = Math.max(seedMax, live.max);
-      } else if (seedMax !== null && seedMax !== undefined && !isNaN(seedMax)) {
-        combinedMax = seedMax;
-      } else {
-        combinedMax = live.max; // may be null when only losses arrived
+    var list = (sampleState.samples || {})[key] || [];
+    var startS = nowS - focusS;
+    var cov = (sampleState.covFrom || {})[key];
+    // 1. Hydrated window: a stats-window backfill plus live SSE make the raw
+    //    buffer the complete, deduplicated census of the selected window, so
+    //    the unique raw samples are the SOLE statistics source. The snapshot
+    //    aggregate is retired the moment coverage is complete — it is a
+    //    loading baseline, never an indefinitely renewable total.
+    if (typeof cov === "number" && cov <= startS) {
+      var raw = PURE.computeStatsWindow(list, nowS, focusS);
+      return {
+        source: "live",
+        data: raw || { count: 0, avg: null, min: null, max: null, cur: null, lossPct: 0 },
+      };
+    }
+    // 2. Loading baseline: the server snapshot aggregate for the stream plus
+    //    buffered samples STRICTLY AFTER its matching cutoff (the payload's
+    //    sample_through_t, captured from the same immutable read as the
+    //    aggregate). The two parts are disjoint by construction — the buffer
+    //    also carries the merged snapshot tail for graphs, which must never
+    //    be counted twice. Validity is bounded by the aggregate's OLDEST
+    //    sample: it counts exactly the window's [sample_from_t ..
+    //    sample_through_t] samples, so it remains a complete census of the
+    //    selected window only while that oldest sample is still at/after the
+    //    window start (nowS <= from + focusS — inclusive: a sample exactly
+    //    on the start boundary is counted). Mere window overlap is NOT
+    //    enough: once the oldest sample crosses the start, the aggregate
+    //    would overcount and is retired; the raw buffer (retained for
+    //    graphs) becomes the deliberately-partial source until refreshed
+    //    coverage lands. focusS 0 degrades cleanly: the single-instant
+    //    window only admits a baseline whose oldest sample IS the instant.
+    //    A baseline fetched for a different window width (echoed focus_s)
+    //    is suspended until the refetched snapshot for the new window lands.
+    var seed = (sampleState.seedStats || {})[key];
+    var cut = (sampleState.seedCut || {})[key];
+    var from = (sampleState.seedFrom || {})[key];
+    var seedFocus = (sampleState.seedFocus || {})[key];
+    var baselineLive =
+      seed && typeof cut === "number" && isFinite(cut) &&
+      typeof from === "number" && isFinite(from) &&
+      seedFocus === focusS && nowS <= from + focusS;
+    if (baselineLive) {
+      var delta = [];
+      for (var i = 0; i < list.length; i++) {
+        var s = list[i];
+        if (s.t > cut && s.t >= startS) delta.push(s);
       }
-      return { source: "combined", data: {
-        count: seed.count + live.count,
-        avg: totalSuccess ? ((seed.avg_ms || 0) * seedSuccess + (live.avg || 0) * liveSuccess) / totalSuccess : null,
-        min: seed.min_ms === null || seed.min_ms === undefined ? live.min : (live.min === null ? seed.min_ms : Math.min(seed.min_ms, live.min)),
-        max: combinedMax,
-        cur: live.cur,
-        lossPct: (seed.count + live.count) ? ((seed.count * (seed.loss_pct || 0) / 100 + live.count * live.lossPct / 100) / (seed.count + live.count)) * 100 : 0,
+      if (delta.length > 0) {
+        var live = PURE._statsFromWindow(delta);
+        var seedSuccess = seed.count * (1 - (seed.loss_pct || 0) / 100);
+        var liveSuccess = live.count * (1 - live.lossPct / 100);
+        var totalSuccess = seedSuccess + liveSuccess;
+        // Snapshot stats historically ship without max_ms. Whisker rendering
+        // needs min AND max, so take whichever seed value is present (future
+        // snapshots) and merge with the live max; if both are absent, max
+        // stays null and the renderer degrades to markers-only (no whisker).
+        var seedMax = seed.max_ms;
+        var combinedMax;
+        if (seedMax !== null && seedMax !== undefined && !isNaN(seedMax) &&
+            live.max !== null && live.max !== undefined && !isNaN(live.max)) {
+          combinedMax = Math.max(seedMax, live.max);
+        } else if (seedMax !== null && seedMax !== undefined && !isNaN(seedMax)) {
+          combinedMax = seedMax;
+        } else {
+          combinedMax = live.max; // may be null when only losses arrived
+        }
+        return { source: "combined", data: {
+          count: seed.count + live.count,
+          avg: totalSuccess ? ((seed.avg_ms || 0) * seedSuccess + (live.avg || 0) * liveSuccess) / totalSuccess : null,
+          min: seed.min_ms === null || seed.min_ms === undefined ? live.min : (live.min === null ? seed.min_ms : Math.min(seed.min_ms, live.min)),
+          max: combinedMax,
+          cur: live.cur,
+          lossPct: (seed.count + live.count) ? ((seed.count * (seed.loss_pct || 0) / 100 + live.count * live.lossPct / 100) / (seed.count + live.count)) * 100 : 0,
+        }};
+      }
+      // Valid baseline, nothing after its cutoff yet: the baseline alone.
+      return { source: "seed", data: {
+        count: seed.count,
+        avg: seed.avg_ms,
+        min: seed.min_ms,
+        max: seed.max_ms !== undefined ? seed.max_ms : null,
+        cur: seed.cur_ms,
+        lossPct: seed.loss_pct,
       }};
     }
-    // Once the snapshot baseline expires, use the browser's live window. In
-    // the normal case its coverage is continuous from the latest snapshot
-    // sample (focusS seconds); if probing was paused or had gaps, the
-    // live-only count is intentionally the accurate (possibly partial) view
-    // rather than a stale baseline that makes the count appear to run
-    // forever.
-    if (live && live.count > 0) {
-      return { source: "live", data: live };
-    }
-    if (seed && baselineLive) {
-      return { source: "seed", data: seedFromSnapshot(seed) };
+    // 3. No hydrated coverage and no valid baseline: the raw window alone.
+    //    Deliberately partial (the buffer holds only what this client has
+    //    seen) rather than a stale aggregate presented as the selected
+    //    window; the next snapshot/backfill refreshes coverage.
+    var liveOnly = PURE.computeStatsWindow(list, nowS, focusS);
+    if (liveOnly && liveOnly.count > 0) {
+      return { source: "live", data: liveOnly };
     }
     return null;
+  };
+
+  /**
+   * Authoritative primary-stream facts for the footer: the SAME stats object
+   * the table and copied summary show for the hop (manual drag-focus wins,
+   * then the Focus window), and the last committed sample time from the
+   * stream's raw buffer — buffer-derived so a restored tab shows the
+   * existing history's recency instead of a blank until the next live round.
+   */
+  PURE.primaryStreamFacts = function (sampleState, hopIndex, nowS, focusS) {
+    var st = sampleState || {};
+    var stats = PURE.displayStatsForHop(st, hopIndex, nowS, focusS);
+    var list = (st.samples || {})[String(hopIndex)] || [];
+    var lastT = list.length > 0 ? list[list.length - 1].t : null;
+    return {
+      stats: stats ? stats.data : null,
+      lastT: typeof lastT === "number" && isFinite(lastT) ? lastT : null,
+    };
   };
 
   PURE.statsForHop = function (sampleState, hopIndex, nowS) {
@@ -2280,12 +2516,28 @@
       // rendering branch is driven by the panel's range (range >
       // RAW_RANGE_MAX_S → bucket rendering).
       buckets: {}, // hopIndex (string) -> [{t, avg_ms, min_ms, max_ms, count, loss_count}]
-      seedStats: {}, // hopIndex (string) -> {count, avg_ms, min_ms, cur_ms, loss_pct}
-      seedUntil: {}, // snapshot baseline expiry, keyed by hop index
-      seedWatermark: {}, // samples at/before this time are in the baseline
-      seedTargetStats: null, // top-level snapshot stats for the hop=0/target stream
-      lastRoundT: null,
-      roundsReceived: 0,
+      seedStats: {}, // hopIndex (string) -> server snapshot stats for the stream
+      // Snapshot baseline accounting, per stream key (contract: captured_at
+      // is the single effective capture reference — frozen at paused_at
+      // while paused; sample_through_t/sample_from_t are extrema of the
+      // exact stats window, null when empty).
+      seedCut: {}, // hopIndex (string) -> sample_through_t; delta cutoff + SSE watermark
+      seedFrom: {}, // hopIndex (string) -> sample_from_t; baseline aging anchor
+      seedCap: {}, // hopIndex (string) -> captured_at; latest capture marker (survives empty clears)
+      seedFocus: {}, // hopIndex (string) -> focus_s the baseline window used
+      seedWatermark: {}, // samples at/below this server-reported cutoff are in the baseline
+      // Raw-buffer coverage: earliest t the per-hop buffer is a complete
+      // census of the server's samples from (stats-window backfills + live
+      // SSE). Wiped the moment the SSE transport breaks and again on
+      // reconnect — samples during an outage are missed, so no completeness
+      // claim may survive it. covInFlight bounds one outstanding backfill
+      // per current stream; covGen is the connection-continuity generation
+      // captured by coverage requests and checked on adoption, fencing
+      // responses that crossed a break/reconnect from establishing coverage.
+      covFrom: {},
+      covInFlight: {},
+      covGen: 0,
+      covConnected: false,
       es: null, // EventSource
       runningKnown: false, // last known session.state == "running"
       routeState: null, // pending | ready | failed
@@ -2481,14 +2733,10 @@
     function applyFocusWindowChange(newValue) {
       state.focusWindowValue = newValue;
       ++state.focusChangeSeq;
-      // Recompute seed-baseline expiry for every known baseline so it follows
-      // the new window.
-      var focusS = currentFocusSeconds();
-      Object.keys(state.seedWatermark).forEach(function (key) {
-        if (state.seedWatermark[key] !== undefined) {
-          state.seedUntil[key] = state.seedWatermark[key] + focusS;
-        }
-      });
+      // Baselines fetched for the previous window width suspend themselves
+      // (seedFocus no longer matches) until the refetched snapshot below
+      // re-adopts for the new window; coverage is refreshed for the new
+      // window start rather than adding an old aggregate to it.
       // Changing the dropdown clears any active manual drag-focus.
       if (state.focus) {
         state.focus = null;
@@ -2502,6 +2750,7 @@
       if (state.sessionId) {
         fetchSnapshot();
         if (state.hops.length > 0) hydrateHopBaselines(state.hops);
+        refreshStatsCoverage();
       }
     }
 
@@ -2593,28 +2842,6 @@
      *  target field, tab label, toolbar status, route banner. */
     function sessionMaskNames() {
       return PURE.sessionMaskNames(state.target, state.target_dns, state.target_internal);
-    }
-
-    function seedFromSnapshot(s) {
-      return {
-        count: s.count,
-        avg: s.avg_ms,
-        min: s.min_ms,
-        // Snapshot stats do not currently include max_ms. Pass it through when
-        // present (future backend); otherwise null so the combined-path max
-        // logic degrades to live-only and the renderer shows markers without
-        // a whisker rather than inventing a range.
-        max: s.max_ms !== undefined ? s.max_ms : null,
-        cur: s.cur_ms,
-        lossPct: s.loss_pct,
-      };
-    }
-
-    function snapshotExpiry(snap) {
-      var samples = snap.samples || [];
-      var v = PURE.snapshotExpiry(samples, currentFocusSeconds());
-      if (v === undefined) return effNowS();
-      return v;
     }
 
     // ----- focus window -------------------------------------------------
@@ -3983,13 +4210,20 @@
           ? Math.floor(secs / 60) + "m" + (secs % 60) + "s"
           : secs + "s";
       }
+      // Authoritative primary-stream facts: the SAME stats source the table
+      // and copied summary use for the selected window (never an SSE message
+      // counter, which reconnect/history restoration would give a different
+      // meaning), and the last committed sample time from the primary
+      // stream's raw buffer so restored history does not leave it blank.
+      var primary = primaryHopIndex();
+      var facts = PURE.primaryStreamFacts(state, primary, effNowS(), currentFocusSeconds());
       var lastRound = "—";
-      if (state.lastRoundT) {
-        var d = new Date(state.lastRoundT * 1000);
+      if (facts.lastT !== null) {
+        var d = new Date(facts.lastT * 1000);
         lastRound = d.toLocaleTimeString();
       }
       els.statusLine.textContent =
-        "samples " + state.roundsReceived +
+        "samples " + (facts.stats ? facts.stats.count : 0) +
         " · elapsed " + elapsed +
         " · last round " + lastRound;
     }
@@ -4050,38 +4284,51 @@
         state.hops = snap.hops.map(function (h) {
           return { index: h.index, ip: h.ip, dns: h.dns, internal: !!h.internal };
         });
-        state.seedStats = {};
-        var baselineUntil = snapshotExpiry(snap);
+        // Per-hop baseline adoption is monotonic in ``captured_at`` (see
+        // adoptSnapshotBaseline): a slower per-hop or earlier snapshot
+        // response cannot regress a newer baseline, and an empty stream
+        // clears its baseline (retaining the capture marker) instead of
+        // leaving a stale aggregate an older snapshot could resurrect.
+        // Hops the snapshot no longer lists drop their baseline entries
+        // outright.
+        var snapHopKeys = {};
         for (var i = 0; i < snap.hops.length; i++) {
           var h = snap.hops[i];
-          if (h.stats && h.stats.count > 0) {
-            state.seedStats[String(h.index)] = h.stats;
-            state.seedUntil[String(h.index)] = baselineUntil;
-          }
+          snapHopKeys[String(h.index)] = true;
+          PURE.adoptSnapshotBaseline(
+            state, String(h.index), h.stats, snap.captured_at,
+            h.sample_through_t, h.sample_from_t, PURE.snapshotFocusSeconds(snap)
+          );
         }
+        ["seedStats", "seedCut", "seedFrom", "seedCap", "seedFocus", "seedWatermark"]
+          .forEach(function (map) {
+            Object.keys(state[map]).forEach(function (k) {
+              if (k !== "0" && !snapHopKeys[k]) delete state[map][k];
+            });
+          });
       }
       if (snap.stats) {
-        if (snap.stats.count > 0) state.seedStats["0"] = snap.stats;
-        if (snap.stats.count > 0) state.seedUntil["0"] = snapshotExpiry(snap);
-        var targetWatermark = PURE.snapshotWatermark(snap.samples);
-        if (targetWatermark === undefined) delete state.seedWatermark["0"];
-        else {
-          state.seedWatermark["0"] = targetWatermark;
-          // Slice D1 — MERGE the snapshot tail into the timeline buffer
-          // instead of discarding local samples at the watermark (the
-          // old filter-without-merge blanked timelines on
-          // initial load, route discovery, Focus changes, and SSE
-          // reconnects). The watermark still guards pushSample against
-          // double-counting SSE rounds already covered by the snapshot, so
-          // merging is safe: future SSE rounds at/below the watermark are
-          // rejected, and the buffer now carries the snapshot's history.
-          var liveTarget = state.samples["0"] || [];
-          if (Array.isArray(snap.samples) && snap.samples.length > 0) {
-            noteRepliesInList(0, snap.samples);
-            state.samples["0"] = PURE.mergeSamples(liveTarget, snap.samples, RAW_CAP);
-          } else {
-            state.samples["0"] = liveTarget;
-          }
+        // Target stream (hop 0): same contract fields, same single
+        // ``captured_at`` reference as the hops[] entries above. The cutoff
+        // NEVER falls back to the client receipt time or the latest local
+        // sample; a payload without ``captured_at`` is not adopted.
+        PURE.adoptSnapshotBaseline(
+          state, "0", snap.stats, snap.captured_at,
+          snap.sample_through_t, snap.sample_from_t, PURE.snapshotFocusSeconds(snap)
+        );
+        // Merge the snapshot tail into the timeline buffer so GRAPHS keep
+        // the full raw history (the old filter-without-merge blanked
+        // timelines on initial load, route discovery, Focus changes, and
+        // SSE reconnects). Accounting never subtracts these samples: the
+        // baseline's delta cutoff (sample_through_t) already excludes them
+        // from the live part of the combined stats, and once the stats
+        // window is hydrated the unique raw buffer is the sole statistics
+        // source.
+        if (Array.isArray(snap.samples) && snap.samples.length > 0) {
+          noteRepliesInList(0, snap.samples);
+          state.samples["0"] = PURE.mergeSamples(
+            state.samples["0"] || [], snap.samples, RAW_CAP
+          );
         }
       }
       // State adoption: AUTHORITATIVE when no control transition is pending.
@@ -4136,6 +4383,11 @@
       pruneStaleTimelines();
       updateRouteBanner();
       refreshButtonLabels();
+      // Refresh the selected stats window's raw coverage for every table
+      // hop so accounting graduates from the snapshot baseline to the
+      // unique raw buffer once the backfill lands (initial hydration and
+      // any later adoption that finds the window not fully covered).
+      refreshStatsCoverage();
       renderTable();
       renderTimelines();
       renderFocusCaption();
@@ -4239,6 +4491,7 @@
     // ----- SSE ----------------------------------------------------------
 
     function openEventSource() {
+      PURE.breakCoverageContinuity(state);
       if (state.es) {
         try { state.es.close(); } catch (e) { /* ignore */ }
         state.es = null;
@@ -4263,12 +4516,26 @@
         // clearing the fact is all that is needed.
         state.reconnecting = false;
         renderStatus();
+        // Coverage continuity died with the transport: events during the
+        // outage were missed, so every raw-buffer completeness claim is
+        // dropped and re-established by the backfills below. Advancing the
+        // continuity generation HERE as well (the error handler advanced it
+        // at the break) fences backfills issued during the outage — they
+        // captured the break generation and their windows still cannot span
+        // the reconnect gap. Old-generation completions may merge raw rows
+        // but can neither establish coverage nor release the current
+        // requests' ownership (their tokens were wiped).
+        PURE.breakCoverageContinuity(state);
+        state.covConnected = true;
         // Slice D1 — reconnect gap fill. The 100-sample snapshot tail may
         // not cover the full disconnect period, so backfill raw history for
         // every open panel. mergeSamples deduplicates the tail already in
         // the buffer, so this is safe even when the snapshot covered the
         // gap. Best-effort; SSE remains the live authority.
         fetchHistoryForOpenPanels();
+        // Re-establish raw coverage of the selected stats window for the
+        // table hops so accounting returns to the hydrated raw buffer.
+        refreshStatsCoverage();
       });
 
       es.addEventListener("route", function (ev) {
@@ -4291,6 +4558,9 @@
           // so its timeline isn't empty while the snapshot tail only covers
           // the last few rounds. The merge deduplicates any overlap.
           fetchHistory(primaryHopIndex());
+          // New table hops need their own stats-window coverage before raw
+          // samples can be the sole statistics source for their rows.
+          refreshStatsCoverage();
           // Refetch the top-level snapshot so the resolved target IP/DNS is
           // available client-side. applySnapshot is idempotent.
           fetchSnapshot();
@@ -4307,6 +4577,15 @@
         // so no per-handler guard is needed. The ready handler clears
         // this fact on the next successful connect.
         state.reconnecting = true;
+        // Coverage continuity died with the transport: samples arriving
+        // while the stream is down are missed, so every raw-buffer
+        // completeness claim is invalidated NOW, not on reconnect, and the
+        // continuity generation advances. Backfills already in flight
+        // captured the pre-break generation: their completions may still
+        // merge raw rows, but they can no longer establish coverage or
+        // release ownership (their tokens were wiped), and the current
+        // generation's backfill is triggered by the ready handler below.
+        PURE.breakCoverageContinuity(state);
         renderStatus();
       });
 
@@ -4348,25 +4627,25 @@
             if (snap.icmp_non_responsive !== undefined) {
               state.hopNr[key] = !!snap.icmp_non_responsive;
             }
-            if (snap.stats.count > 0) {
-              if (snap.stats.avg_ms !== null && snap.stats.avg_ms !== undefined) {
-                noteReplied(key);
-              }
-              state.seedStats[key] = snap.stats;
-              state.seedUntil[key] = snapshotExpiry(snap);
-              var watermark = PURE.snapshotWatermark(snap.samples);
-              if (watermark !== undefined) {
-                state.seedWatermark[key] = watermark;
-                // Slice D1 — merge the per-hop snapshot tail instead of
-                // filtering local samples away.
-                var live = state.samples[key] || [];
-                if (Array.isArray(snap.samples) && snap.samples.length > 0) {
-                  noteRepliesInList(key, snap.samples);
-                  state.samples[key] = PURE.mergeSamples(live, snap.samples, RAW_CAP);
-                } else {
-                  state.samples[key] = live;
-                }
-              } else delete state.seedWatermark[key];
+            if (snap.stats.count > 0 &&
+                snap.stats.avg_ms !== null && snap.stats.avg_ms !== undefined) {
+              noteReplied(key);
+            }
+            // Baseline + cutoff adoption under the same contract as the
+            // top-level path: monotonic in captured_at (an older per-hop
+            // response cannot regress a newer baseline), empty payloads
+            // clear (retaining the capture marker), and the cutoff NEVER
+            // falls back to receipt time. The tail merge keeps the whole
+            // raw buffer for graphs.
+            PURE.adoptSnapshotBaseline(
+              state, key, snap.stats, snap.captured_at,
+              snap.sample_through_t, snap.sample_from_t, PURE.snapshotFocusSeconds(snap)
+            );
+            if (Array.isArray(snap.samples) && snap.samples.length > 0) {
+              noteRepliesInList(key, snap.samples);
+              state.samples[key] = PURE.mergeSamples(
+                state.samples[key] || [], snap.samples, RAW_CAP
+              );
             }
             renderTable();
           })
@@ -4376,8 +4655,6 @@
 
     function handleRound(data) {
       if (!data || !data.results) return;
-      state.roundsReceived++;
-      state.lastRoundT = data.t;
       for (var i = 0; i < data.results.length; i++) {
         var r = data.results[i];
         if (typeof r.hop !== "number") continue;
@@ -4470,8 +4747,14 @@
           state.samples = {};
           state.buckets = {}; // Slice D2 — clear rollup buffer on start
           state.seedStats = {};
-          state.seedUntil = {};
+          state.seedCut = {};
+          state.seedFrom = {};
+          state.seedCap = {};
+          state.seedFocus = {};
           state.seedWatermark = {};
+          state.covFrom = {};
+          state.covInFlight = {};
+          state.covConnected = false;
           state.hops = [];
           // Fresh trace: reset trace-local classification facts.
           state.target_internal = false;
@@ -4479,8 +4762,6 @@
           state.hopNr = {};
           state.throughputPoints = [];
           state.throughputError = null;
-          state.roundsReceived = 0;
-          state.lastRoundT = null;
           state.routeState = "pending";
           state.runningKnown = true;
           // Starting a fresh trace always runs: no freeze.
@@ -4559,13 +4840,47 @@
     // (background tabs merge into their own buffers without painting). The
     // request is generation-guarded by historyRequestSeq plus the session and
     // focus generations, so a stale fetch landing after reset/close/focus
-    // change cannot write into an obsolete view. Snapshot requests use a
+    // change cannot write into an obsolete view. Coverage backfills
+    // additionally capture the connection-continuity generation
+    // (state.covGen): a response that crossed an SSE break/reconnect may
+    // merge raw rows but cannot establish coverage. Snapshot requests use a
     // separate generation and do not cancel valid history backfills.
+    //
+    // Coverage mode (opts.forCoverage) backfills the SELECTED stats window
+    // for a table hop and records that the raw buffer is a complete census
+    // from the fetched window start forward — the accounting precondition
+    // for raw-only statistics (see PURE.statsForHopWindow).
 
-    function fetchHistory(hopIndex) {
+    // Ownership tokens for in-flight coverage backfills (one per request,
+    // monotonic within this tab). A completion releases the stream's marker
+    // only while its token still owns it (see PURE.releaseCoverageInFlight),
+    // so a stale focus/reset response — or one whose marker a transport
+    // break/reconnect wiped — can never release a newer generation's
+    // in-flight backfill.
+    var coverageRequestSeq = 0;
+
+    function fetchHistory(hopIndex, opts) {
+      opts = opts || {};
       var sid = state.sessionId;
       if (!sid || state.closing || state.resetting) return Promise.resolve();
-      var rangeS = rangeForPanel(hopIndex);
+      var forCoverage = !!opts.forCoverage;
+      var key = String(hopIndex);
+      // Coverage mode backfills the SELECTED stats window (Focus) instead of
+      // the panel's range — always raw, since focus windows sit far below
+      // RAW_RANGE_MAX_S. The in-flight flag is set only after the guards
+      // pass, so a closed/reset tab never leaves it stuck.
+      var rangeS = opts.rangeS != null ? opts.rangeS : rangeForPanel(hopIndex);
+      // One outstanding backfill per stream: the marker carries THIS
+      // request's ownership token, so a stale generation's completion (its
+      // marker wiped by a reconnect/reset or replaced by a newer backfill)
+      // can never release the newer request's flag.
+      var covToken = null;
+      var covGen = null;
+      if (forCoverage) {
+        covToken = ++coverageRequestSeq;
+        covGen = state.covGen;
+        state.covInFlight[key] = covToken;
+      }
       // Slice D2 — pick the resolution based on the panel's range. Ranges
       // ≤ RAW_RANGE_MAX_S keep D1 raw behaviour (default raw); ranges
       // beyond use ``auto`` so the server resolves raw/1m against raw
@@ -4587,11 +4902,14 @@
       return api(url)
         .then(asJson)
         .then(function (body) {
+          // Terminal for every path: release the marker only while this
+          // request still owns it — a newer generation's backfill may have
+          // taken the marker over while this one was in flight.
+          if (forCoverage) PURE.releaseCoverageInFlight(state, key, covToken);
           if (state.closing || state.resetting || state.sessionId !== sid ||
            state.historyRequestSeq !== requestSeq ||
                state.focusChangeSeq !== focusChangeSeq) return;
           if (!body) return;
-          var key = String(hopIndex);
           // ``auto`` is allowed to resolve to raw when a session's configured
           // interval gives it unusually long raw retention. Long panels must
           // still render the separate bucket buffer, so follow that response
@@ -4630,12 +4948,65 @@
             noteRepliesInList(hopIndex, body.samples);
             var existing = state.samples[key] || [];
             state.samples[key] = PURE.mergeSamples(existing, body.samples, RAW_CAP);
+            // Adopted raw response over [startS, endS]: the buffer is now a
+            // complete census of the server's samples from startS forward
+            // (live SSE keeps it current until the transport drops). Only
+            // RAW responses may claim coverage — buckets are a different
+            // resolution and never enter the raw buffer — and only while
+            // the response still belongs to the connection generation it
+            // was issued on: one that crossed a transport break/reconnect
+            // missed server-side samples and may merge its rows but must
+            // never establish completeness (PURE.extendCoverageIfCurrent).
+            if (forCoverage) {
+              PURE.extendCoverageIfCurrent(state, key, startS, covGen, state.covGen);
+            }
           } else {
             return;
           }
-          if (isActive()) renderTimelines();
+          if (isActive()) {
+            // A coverage adoption can flip a hop's accounting source
+            // (baseline-combined -> hydrated raw-only), so the hop table and
+            // footer (same primary-stream stats source) must repaint
+            // alongside the timeline; panel backfills keep the existing
+            // timeline-only repaint.
+            if (forCoverage) {
+              renderTable();
+              renderFooterStatus();
+            }
+            renderTimelines();
+          }
         })
-        .catch(function () { /* best-effort; SSE remains authoritative */ });
+        .catch(function () {
+          if (forCoverage) PURE.releaseCoverageInFlight(state, key, covToken);
+          /* best-effort; SSE remains authoritative */
+        });
+    }
+
+    /**
+     * Backfill the SELECTED raw stats window (Focus) for every table hop —
+     * the target stream plus each known route hop, not just open timeline
+     * panels — so hop accounting can graduate from the snapshot baseline to
+     * the unique raw buffer (sole statistics source) once coverage is
+     * complete. One outstanding backfill per stream (covInFlight carries the
+     * owning request's token); adoption is generation-guarded inside
+     * fetchHistory (focus/reset sequence AND connection continuity), and a
+     * terminal fetch releases the marker only while its token still owns
+     * it, so the next snapshot adoption or transport break/reconnect
+     * retries.
+     */
+    function refreshStatsCoverage() {
+      var keys = { "0": true };
+      for (var i = 0; i < state.hops.length; i++) {
+        keys[String(state.hops[i].index)] = true;
+      }
+      var focusS = currentFocusSeconds();
+      var startS = effNowS() - focusS;
+      Object.keys(keys).forEach(function (k) {
+        if (state.covInFlight[k]) return;
+        var cov = state.covFrom[k];
+        if (typeof cov === "number" && cov <= startS) return;
+        fetchHistory(Number(k), { rangeS: focusS, forCoverage: true });
+      });
     }
 
     function fetchHistoryForOpenPanels() {
@@ -4972,8 +5343,14 @@
       state.samples = {};
       state.buckets = {}; // Slice D2 — clear rollup buffer on reset
       state.seedStats = {};
-      state.seedUntil = {};
+      state.seedCut = {};
+      state.seedFrom = {};
+      state.seedCap = {};
+      state.seedFocus = {};
       state.seedWatermark = {};
+      state.covFrom = {};
+      state.covInFlight = {};
+      state.covConnected = false;
       // Trace-local classification facts reset with the buffers.
       state.target_internal = false;
       state.hopEverReplied = {};
@@ -4983,8 +5360,6 @@
       state.throughputStep = null;
       state.throughputSeq++;
       state.throughputLastFetchS = 0;
-      state.roundsReceived = 0;
-      state.lastRoundT = null;
       state.routeState = null;
       state.runningKnown = false;
       state.controlAction = null;
