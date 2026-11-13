@@ -618,6 +618,7 @@ td.cell-ip,
 td.cell-dns {
   font-family: var(--mono);
   font-size: 12px;
+  cursor: text;
 }
 
 td.cell-ip.silent,

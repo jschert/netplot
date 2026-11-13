@@ -3868,12 +3868,28 @@
       return true;
     }
 
-    function renderRow(hop, axisMax, nowS) {
-      var tr = document.createElement("tr");
-      tr.setAttribute("data-hop", String(hop.index));
+    function setCellText(cell, text) {
+      // Replacing unchanged text nodes destroys native browser selections.
+      if (cell.textContent !== text) cell.textContent = text;
+    }
+
+    function renderRow(hop, axisMax, nowS, tr) {
+      if (!tr) {
+        tr = document.createElement("tr");
+        tr.setAttribute("data-hop", String(hop.index));
+        [
+          "cell-status", "cell-hop num", "cell-count num", "cell-ip", "cell-dns",
+          "cell-avg num", "cell-min num", "cell-cur num", "cell-pl num", "cell-graph",
+        ].forEach(function (className) {
+          var td = document.createElement("td");
+          td.className = className;
+          tr.appendChild(td);
+        });
+        tr.cells[9].appendChild(buildGraphEl());
+      }
       var isFinalTarget = isTargetHop(hop);
       var isTargetRow = !!hop.targetRow;
-      if (isFinalTarget || isTargetRow) tr.className = "row-target";
+      tr.className = isFinalTarget || isTargetRow ? "row-target" : "";
 
       var stats = statsForHopDisplay(hop.index, nowS);
       var sd = stats ? stats.data : null;
@@ -3881,96 +3897,83 @@
       // have never replied in this trace). Counts/loss stay truthful; only
       // the styling and the Cur marker text change.
       var nr = hopNonResponsiveFlag(hop);
-      var tdStatus = document.createElement("td");
-      tdStatus.className = "cell-status";
-      if (isFinalTarget) {
-        var glyph = document.createElement("span");
+      var tdStatus = tr.cells[0];
+      var glyph = tdStatus.querySelector(".status-target-glyph");
+      if (isFinalTarget && !glyph) {
+        glyph = document.createElement("span");
         glyph.className = "status-target-glyph";
         glyph.setAttribute("aria-hidden", "true");
         glyph.textContent = "📈";
-        tdStatus.appendChild(glyph);
+        tdStatus.insertBefore(glyph, tdStatus.firstChild);
+      } else if (!isFinalTarget && glyph) {
+        tdStatus.removeChild(glyph);
       }
-      var dot = document.createElement("span");
+      var dot = tdStatus.querySelector(".status-dot");
+      if (!dot) {
+        dot = document.createElement("span");
+        tdStatus.appendChild(dot);
+      }
       dot.className = "status-dot status-" + statusDotKind(hop, sd, nr);
-      if (nr) dot.title = "ICMP non-responsive";
-      tdStatus.appendChild(dot);
+      dot.title = nr ? "ICMP non-responsive" : "";
 
-      var tdHop = document.createElement("td");
-      tdHop.className = "cell-hop num";
+      var tdHop = tr.cells[1];
       if (isTargetRow) {
-        var hopGlyph = document.createElement("span");
-        hopGlyph.className = "cell-hop-target-glyph";
-        hopGlyph.setAttribute("aria-hidden", "true");
-        hopGlyph.textContent = "📈";
-        tdHop.appendChild(hopGlyph);
+        if (!tdHop.querySelector(".cell-hop-target-glyph")) {
+          setCellText(tdHop, "");
+          var hopGlyph = document.createElement("span");
+          hopGlyph.className = "cell-hop-target-glyph";
+          hopGlyph.setAttribute("aria-hidden", "true");
+          hopGlyph.textContent = "📈";
+          tdHop.appendChild(hopGlyph);
+        }
       } else {
-        tdHop.textContent = String(hop.index);
+        setCellText(tdHop, String(hop.index));
       }
 
-      var tdCount = document.createElement("td");
-      tdCount.className = "cell-count num";
-
-      var tdIp = document.createElement("td");
+      var tdCount = tr.cells[2];
+      var tdIp = tr.cells[3];
       tdIp.className = "cell-ip" + (hop.ip ? "" : " silent");
-      tdIp.textContent = fmtIp(hop.ip);
+      setCellText(tdIp, fmtIp(hop.ip));
 
-      var tdDns = document.createElement("td");
+      var tdDns = tr.cells[4];
       tdDns.className = "cell-dns" + (hop.dns ? "" : " silent");
       // Display-only masking: an internal host's DNS name becomes the
       // neutral alias while the screenshot toggle is on. IPs are never
       // masked; absent names keep their "—"/"*" placeholders.
-      tdDns.textContent = hop.dns
+      setCellText(tdDns, hop.dns
         ? PURE.maskDnsName(hop.dns, hopInternal(hop), maskState.on)
-        : fmtDns(hop.dns, hop.ip);
+        : fmtDns(hop.dns, hop.ip));
 
-      var tdAvg = document.createElement("td");
-      tdAvg.className = "cell-avg num";
-
-      var tdMin = document.createElement("td");
-      tdMin.className = "cell-min num";
-
-      var tdCur = document.createElement("td");
-      tdCur.className = "cell-cur num";
-
-      var tdPl = document.createElement("td");
-      tdPl.className = "cell-pl num";
-
-      var tdGraph = document.createElement("td");
-      tdGraph.className = "cell-graph";
-      var graph = buildGraphEl();
-      tdGraph.appendChild(graph);
+      var tdAvg = tr.cells[5];
+      var tdMin = tr.cells[6];
+      var tdCur = tr.cells[7];
+      var tdPl = tr.cells[8];
+      var graph = tr.cells[9].firstChild;
+      tdCur.removeAttribute("title");
 
       if (stats) {
-        tdCount.textContent = String(sd.count);
-        tdAvg.textContent = PURE.formatMs(sd.avg);
-        tdMin.textContent = PURE.formatMs(sd.min);
-        tdCur.textContent = sd.cur === null ? (nr ? "NR" : "ERR") : PURE.formatMs(sd.cur);
+        setCellText(tdCount, String(sd.count));
+        setCellText(tdAvg, PURE.formatMs(sd.avg));
+        setCellText(tdMin, PURE.formatMs(sd.min));
+        setCellText(tdCur, sd.cur === null ? (nr ? "NR" : "ERR") : PURE.formatMs(sd.cur));
         if (nr) {
           tdCur.title = "ICMP non-responsive: no replies observed in this trace";
         }
-        tdPl.textContent = PURE.formatPl(sd.lossPct);
+        setCellText(tdPl, PURE.formatPl(sd.lossPct));
         applyCurClass(tdCur, sd.cur, nr);
         applyPlClass(tdPl, sd.lossPct);
         renderGraph(graph, sd, axisMax, nr);
       } else {
-        tdCount.textContent = "0";
-        tdAvg.textContent = "—";
-        tdMin.textContent = "—";
-        tdCur.textContent = "—";
-        tdPl.textContent = "0.0";
+        setCellText(tdCount, "0");
+        setCellText(tdAvg, "—");
+        setCellText(tdMin, "—");
+        setCellText(tdCur, "—");
+        setCellText(tdPl, "0.0");
+        tdCur.classList.remove("ok", "loss", "nr");
+        tdPl.classList.remove("low", "warn", "high");
         renderGraph(graph, null, axisMax);
       }
 
-      tr.appendChild(tdStatus);
-      tr.appendChild(tdHop);
-      tr.appendChild(tdCount);
-      tr.appendChild(tdIp);
-      tr.appendChild(tdDns);
-      tr.appendChild(tdAvg);
-      tr.appendChild(tdMin);
-      tr.appendChild(tdCur);
-      tr.appendChild(tdPl);
-      tr.appendChild(tdGraph);
       return tr;
     }
 
@@ -4183,7 +4186,6 @@
       var legendMax = renderGraphColumnChrome(axisMax);
       renderLegendMarkers(displayHops, legendMax, nowS);
 
-      clearTable();
       if (displayHops.length === 0) {
         showEmptyRow(state.sessionId
           ? "Waiting for route discovery…"
@@ -4191,9 +4193,23 @@
         renderConnector(axisMax);
         return;
       }
+      var rows = {};
+      Array.prototype.forEach.call(els.tableBody.children, function (row) {
+        var key = row.getAttribute("data-hop");
+        if (key === null) els.tableBody.removeChild(row);
+        else rows[key] = row;
+      });
       for (var j = 0; j < displayHops.length; j++) {
-        els.tableBody.appendChild(renderRow(displayHops[j], axisMax, nowS));
+        var hop = displayHops[j];
+        var key = String(hop.index);
+        var row = renderRow(hop, axisMax, nowS, rows[key]);
+        var next = els.tableBody.children[j] || null;
+        if (row !== next) els.tableBody.insertBefore(row, next);
+        delete rows[key];
       }
+      Object.keys(rows).forEach(function (key) {
+        els.tableBody.removeChild(rows[key]);
+      });
       renderConnector(axisMax);
     }
 
@@ -5786,6 +5802,7 @@
 
     // Hop-row double-click toggles a non-primary timeline for the active tab.
     els.tableBody.addEventListener("dblclick", function (ev) {
+      if (ev.target.closest && ev.target.closest(".cell-ip, .cell-dns")) return;
       var tr = ev.target.closest ? ev.target.closest("tr[data-hop]") : null;
       if (!tr) return;
       var hopIndex = Number(tr.getAttribute("data-hop"));

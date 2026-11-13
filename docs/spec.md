@@ -39,7 +39,8 @@ NOT imply end-to-end loss; the final target's stats are the trusted result.
 6. Continuous sample history with range selector.
 7. Focus window: selecting a historical region recomputes table stats for
    that period.
-8. Double-click a hop row to open/hide that hop's timeline.
+8. Double-click a hop row outside its IP/DNS cells to open/hide that hop's
+   timeline. IP/DNS cells keep native text selection and copying.
 
 ### P1 (desirable, later)
 
@@ -50,10 +51,19 @@ formerly listed here — shipped in the Slice 7 / multi-trace tabs work
 described below. Persistent background collections — formerly listed in
 P2 — shipped in the Slice B work described below.)*
 
-### P2 (documented out of scope)
+### Planned parity work (not shipped)
 
-`.pp2` compatibility, alerts, UDP/TCP packet modes, remote agents/cloud,
-jitter/MOS, route-change history, summaries.
+The [coordinated implementation plan](plan-probing-history-scale.md) covers
+continuous TTL-aware probing, route-change history, durable measurement
+history, TCP/UDP modes, advanced probe controls, jitter, and larger target
+counts. These are planned changes, not capabilities of released v0.1.4.
+The current implementation and contracts below remain the baseline until
+the planned engine/storage cutover is implemented and verified.
+
+### Remaining out of scope
+
+`.pp2` compatibility, built-in alerts, remote agents/cloud, MOS, and
+cross-target summary dashboards remain outside that plan.
 
 ### Persistent (background) collections (Slice B)
 
@@ -1060,9 +1070,14 @@ The Slice 5 timeline graph renders one `<canvas>` per open hop:
 - A **primary** panel is always shown for the target — the final hop when
   route discovery is ready, or the hop=0 target stream while it is pending
   or has failed (PingPlotter's default target view).
-- **Double-clicking any hop row** toggles a stacked non-primary timeline
-  panel for that hop. Each non-primary panel has a close control; the
-  primary panel does not. Timeline panel state is client-only.
+- **Double-clicking a hop row outside its IP/DNS cells** toggles a stacked
+  non-primary timeline panel for that hop. IP/DNS double-clicks retain native
+  text selection. Each non-primary panel has a close control; the primary
+  panel does not. Timeline panel state is client-only.
+- Live table refreshes reuse existing hop rows and leave unchanged text nodes
+  in place, so dragging and copying IP/DNS text works while probing continues.
+  Actual route/text changes, reset, and trace switching may invalidate a
+  selection; the UI must not retain stale values to preserve highlighting.
 - **Panel header** (Slice 6c — PingPlotter Cloud reference layout): hop
   label on the left, live stats caption in the middle, a per-panel range
   dropdown on the right ("1 minute / 5 minutes / 10 minutes", default

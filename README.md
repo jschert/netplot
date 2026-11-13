@@ -399,6 +399,13 @@ python -m pytest
 node tests/test_app.js
 ```
 
+`tests/check_hop_selection.js` exports a browser-harness regression check
+accepting `{page, tab}` (a Puppeteer-compatible page and a browser tab with
+double-click, count, and native clipboard helpers). Run against an isolated
+dashboard with a running multi-hop trace at a 1-second interval, in Chromium
+and WebKit. It asserts native IP/DNS dragging across live rounds, copied text,
+and the distinction between text double-clicks and hop timeline toggles.
+
 Data-sensitive metrics, history, and export fixtures must control probe and
 DNS dependencies before creating sessions; a live trace can collect a sample
 before an immediate pause. Keep real system-probe coverage in the marked
@@ -433,7 +440,7 @@ policy, and `netplot-data` volume still come from the base file. A bare
 
 ### Endpoints
 
-- `GET /` serves the dashboard UI: a PingPlotter-style toolbar (Play/Pause split, target combobox with recent-targets history, interval preset dropdown, Focus window dropdown, disabled ICMP packet-type dropdown, focus caption line), a live hop table (status / Hop / Count / IP / DNS / Avg / Min / Cur / PL% / Graph), and per-hop latency timeline graphs driven by SSE. The Graph column shows shared 100/200 ms zones, min–max whiskers, average/current markers, packet-loss hatching, and an average connector. The target timeline is always shown; double-click any hop row to add or remove a timeline for that hop. Drag a region on any timeline to focus the table stats on that period (the Focus dropdown is the rolling-window size; manual drag-focus overrides it until cleared). Pausing a trace freezes the view (timelines, stats, focus caption) at the server-recorded pause time; resuming continues from current wall time. The **Copy summary** toolbar button copies a plain-text summary of the active trace's target: the Focus/drag-selected window in UTC, probe interval, target avg/min/max RTT and packet loss — exactly the values the table shows for that window, with the Mask internal DNS toggle respected.
+- `GET /` serves the dashboard UI: a PingPlotter-style toolbar (Play/Pause split, target combobox with recent-targets history, interval preset dropdown, Focus window dropdown, disabled ICMP packet-type dropdown, focus caption line), a live hop table (status / Hop / Count / IP / DNS / Avg / Min / Cur / PL% / Graph), and per-hop latency timeline graphs driven by SSE. The Graph column shows shared 100/200 ms zones, min–max whiskers, average/current markers, packet-loss hatching, and an average connector. The target timeline is always shown; double-click a hop row outside its IP/DNS cells to add or remove a timeline for that hop. IP/DNS text supports normal selection and copying while probe updates continue. Drag a region on any timeline to focus the table stats on that period (the Focus dropdown is the rolling-window size; manual drag-focus overrides it until cleared). Pausing a trace freezes the view (timelines, stats, focus caption) at the server-recorded pause time; resuming continues from current wall time. The **Copy summary** toolbar button copies a plain-text summary of the active trace's target: the Focus/drag-selected window in UTC, probe interval, target avg/min/max RTT and packet loss — exactly the values the table shows for that window, with the Mask internal DNS toggle respected.
 - `GET /static/app.js`, `GET /static/style.css` serve the dashboard assets.
 - `GET /healthz` returns a simple readiness payload.
 - `POST /api/traces` creates and starts a continuous trace against a target (host or IP); route discovery and concurrent per-hop probing begin automatically. See `docs/spec.md` for the full snapshot/SSE contract.
