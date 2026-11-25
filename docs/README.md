@@ -3,6 +3,9 @@
 The product and API contract live in [`spec.md`](spec.md). The root
 [`README.md`](../README.md) contains setup and endpoint instructions.
 
+Planned, not yet implemented: [route-aware probing, route/sample history,
+probe controls, jitter, and scaling](plan-probing-history-scale.md).
+
 ## Slice 6: graph column
 
 The hop table includes a status-dot column and a shared-axis Graph column.
