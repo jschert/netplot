@@ -54,7 +54,7 @@ FROM python:${PYTHON_VERSION}-slim AS runtime
 
 # OCI source annotation. Setting org.opencontainers.image.source lets GHCR
 # associate the pushed image with this repository: a package created on
-# first push inherits the repository's private access instead of sitting
+# first push inherits the repository's access instead of sitting
 # unlinked (and unassociatable) in the registry. CI passes the exact
 # repository URL as a build-arg; the default covers plain local
 # `docker build .` followed by a manual push.
