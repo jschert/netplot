@@ -547,6 +547,8 @@ for the packaging contract.
 
 ## Maintainer notes (releases)
 
+- `main` is protected: changes land through a pull request once CI passes
+  (lint, type check, tests with the coverage floor, and the container smoke).
 - After main-branch CI passes, push a stable `vX.Y.Z` tag matching the
   package version. The tag guard fails the release if the tag, the
   `pyproject.toml` and `uv.lock` versions, `__version__`, or the README's
