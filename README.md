@@ -359,12 +359,16 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 ```
 
-Run the Python and JavaScript checks (the latter requires Node.js):
+Run the checks CI runs (the JavaScript tests require Node.js):
 
 ```bash
-python -m pytest
+ruff check .
+mypy
+python -m pytest --cov=netplot --cov-report=term --cov-fail-under=90
 node tests/test_app.js
 ```
+
+For a quick loop, `python -m pytest` alone skips the coverage floor.
 
 `tests/check_hop_selection.js` exports a browser-harness regression check
 accepting `{page, tab}` (a Puppeteer-compatible page and a browser tab with

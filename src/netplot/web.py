@@ -808,12 +808,12 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         captured_raw = session.history_samples(hop_i, start_s, end_s)
         if captured_raw is None:
             raise HTTPException(status_code=404, detail=f"unknown hop index: {hop_i}")
-        earliest, samples = captured_raw
+        earliest_raw, samples = captured_raw
         return {
             "id": session.id,
             "hop": hop_i,
             "resolution": "raw",
-            "earliest_t": earliest,
+            "earliest_t": earliest_raw,
             "samples": [{"t": t, "rtt_ms": r} for (t, r) in samples],
         }
 

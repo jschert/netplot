@@ -51,6 +51,7 @@ import json
 import logging
 import math
 import ssl
+from typing import Any
 
 import httpx
 
@@ -199,7 +200,7 @@ def parse_points(payload: object) -> list[dict]:
     except ValueError as exc:
         raise InfluxError(f"unexpected influx columns: {columns!r}") from exc
 
-    def _mbps(value: object) -> float | None:
+    def _mbps(value: Any) -> float | None:
         if value is None:
             return None
         try:
@@ -252,7 +253,9 @@ async def fetch_query(
     body = bytearray()
     try:
         async with asyncio.timeout(timeout_s):
-            async with httpx.AsyncClient(
+            # The nesting is deliberate: the deadline wraps the whole
+            # exchange, client close included.
+            async with httpx.AsyncClient(  # noqa: SIM117
                 timeout=timeout_s,
                 follow_redirects=False,
                 # Preserve standard CA overrides without enabling environment proxies.

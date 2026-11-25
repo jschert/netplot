@@ -6,13 +6,13 @@ import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from netplot import influx
-from netplot.security import BrowserBoundaryMiddleware, MAX_REQUEST_BODY_BYTES
+from netplot.security import MAX_REQUEST_BODY_BYTES, BrowserBoundaryMiddleware
 from netplot.session import MAX_SUBSCRIBERS_PER_SESSION, SubscriberLimitReached
 from netplot.settings import DEFAULT_INTERNAL_CIDRS, SETTINGS_FILENAME
-from netplot.web import create_app, SSE_CONCURRENCY_LIMIT, THROUGHPUT_CONCURRENCY_LIMIT
-from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+from netplot.web import SSE_CONCURRENCY_LIMIT, THROUGHPUT_CONCURRENCY_LIMIT, create_app
 
 
 @pytest.mark.parametrize(

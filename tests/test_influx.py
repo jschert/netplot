@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import httpx
 import json
 import shutil
 import ssl
@@ -11,6 +10,7 @@ import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 

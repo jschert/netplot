@@ -190,7 +190,7 @@ async def _blocked_discover(_target: str, _timeout_s: float = 90.0) -> list:
 
 async def _fast_resolve_name(_ip: str) -> None:
     """Reverse-DNS stand-in: no resolver call (test_session.py convention)."""
-    return None
+    return
 
 
 async def _fast_resolve_target(target: str) -> tuple[str | None, str | None]:

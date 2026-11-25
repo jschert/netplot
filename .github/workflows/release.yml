@@ -1,7 +1,7 @@
 # Release pipeline for the public ghcr.io/jschert/netplot image.
 #
 # Maintainer process (documented for README by the parent integration):
-#   1. CI green on main (this is the same test job re-run here).
+#   1. CI green on main (the Python + JS tests are re-run here).
 #   2. Push a stable tag:  git tag v0.1.0 && git push origin v0.1.0
 #   3. This workflow builds BOTH linux/amd64 and linux/arm64, runs a real
 #      container smoke test on each architecture, and only then publishes

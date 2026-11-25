@@ -1,7 +1,7 @@
-# Continuous integration: Python + JS checks and a real container runtime
-# smoke test against a locally built image (amd64 — the runner's native
-# architecture; both release architectures are built, smoked, and gated in
-# release.yml before anything is published).
+# Continuous integration: lint, type check, Python + JS tests with a coverage
+# floor, and a real container runtime smoke test against a locally built image
+# (amd64 — the runner's native architecture; both release architectures are
+# built, smoked, and gated in release.yml before anything is published).
 #
 # Nothing in this workflow pushes images or requires registry credentials.
 name: CI
@@ -45,8 +45,15 @@ jobs:
       - name: Install project + dev dependencies from uv.lock
         run: uv sync --frozen --extra dev
 
-      - name: Python tests
-        run: uv run --no-sync python -m pytest
+      - name: Lint (ruff)
+        run: uv run --no-sync ruff check .
+
+      - name: Type check (mypy)
+        run: uv run --no-sync mypy
+
+      - name: Python tests with coverage floor
+        # Line coverage is 91% today; the floor stops it from silently dropping.
+        run: uv run --no-sync python -m pytest --cov=netplot --cov-report=term --cov-fail-under=90
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0

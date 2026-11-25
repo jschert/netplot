@@ -22,6 +22,7 @@ Stats are computed on read over a focus window; nothing derived is stored.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import logging
 import os
 import socket
@@ -32,6 +33,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from math import isfinite
+from typing import Any
 
 from .engine import (
     RouteDiscoveryError,
@@ -1761,7 +1763,7 @@ class SessionManager:
         """
         loop = asyncio.get_running_loop()
         rounds: list[_ActiveRound] = []
-        children: set[asyncio.Task[None]] = set()
+        children: set[asyncio.Task[Any]] = set()
         # Launch-ordered commit chain: each collector awaits the previous
         # round's commit event before committing. Local per generation, so
         # a resumed session never inherits a stale chain from cancelled
@@ -1816,8 +1818,9 @@ class SessionManager:
         self,
         session: TraceSession,
         loop: asyncio.AbstractEventLoop,
-        rounds: list[_ActiveRound],
-        children: set[asyncio.Task[None]],
+        # ``SessionManager.list`` shadows the builtin in class-scope annotations.
+        rounds: builtins.list[_ActiveRound],
+        children: set[asyncio.Task[Any]],
         commit_chain: asyncio.Event,
     ) -> asyncio.Event:
         """Admit and launch at most one round; return the next chain event.
@@ -1991,7 +1994,7 @@ class SessionManager:
         self,
         session: TraceSession,
         record: _ActiveRound,
-        results: list[float | None],
+        results: builtins.list[float | None],
     ) -> None:
         """Append one round's samples exactly once, in launch order.
 
