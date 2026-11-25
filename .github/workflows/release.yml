@@ -1,4 +1,4 @@
-# Release pipeline for the private ghcr.io/jschert/netplot image.
+# Release pipeline for the public ghcr.io/jschert/netplot image.
 #
 # Maintainer process (documented for README by the parent integration):
 #   1. CI green on main (this is the same test job re-run here).
@@ -36,14 +36,11 @@
 #
 # After the publish job moves the consumer tags, the consumer-gate job
 # replays the documented one-file install path as a brand-new user would:
-# it downloads THIS tag's docker-compose.yml from the public repository
-# with the short-lived job token (no checkout, no build), writes a .env
-# pinning the released X.Y.Z + an ephemeral loopback port, and runs
-# docker compose pull + up -d --wait against the just-published private
-# image. It then proves the package has NOT become anonymously pullable
-# (anonymous registry-denial probe + package metadata when the job token
-# may read it). Nothing in the gate uses a PAT or account-wide secret:
-# GITHUB_TOKEN only, with contents:read/packages:read.
+# it downloads THIS tag's docker-compose.yml anonymously (no checkout,
+# no build), writes a .env pinning the released X.Y.Z + an ephemeral
+# loopback port, and runs docker compose pull + up -d --wait against the
+# just-published public image. A fresh Docker configuration ensures the
+# versioned pull and latest manifest check use no registry credentials.
 #
 # This workflow only ever runs on tag pushes in this repository — it has no
 # pull_request trigger, so a PR can never publish an image.
@@ -261,8 +258,7 @@ jobs:
       #      preserve the config digest recorded before upload).
       #   3. source-label check: the exact image config carries
       #      org.opencontainers.image.source for this repository, which
-      #      makes GHCR associate the package with the repository so the
-      #      private package inherits repository access on first push.
+      #      makes GHCR associate the package with the repository.
       - name: Load smoke-tested images and verify identity
         run: |
           set -euo pipefail
@@ -351,37 +347,21 @@ jobs:
           done
           echo "verify: published bytes are the smoke-tested bytes (no rebuild between smoke and publish)"
 
-  # Post-publish gate: prove a brand-new user can really install THIS
-  # release through the documented one-file pull path while the repo and
-  # the package stay private — using only the short-lived job token.
-  # This job never clones, builds, or runs source: it consumes the release
-  # exactly as the README's Quick Start describes (tagged compose file +
-  # image pull). Read-only permissions: contents:read fetches the tagged
-  # compose file via gh api; packages:read logs into GHCR for the pull.
+  # Post-publish gate: prove a brand-new user can install THIS release
+  # anonymously through the documented one-file pull path.
+  # This job never clones, builds, or runs source: it consumes the tagged
+  # Compose file and public image without a GitHub or registry login.
   # It needs publish to have succeeded, so it only runs for stable tags.
   consumer-gate:
-    name: New-user install gate (private pull path)
+    name: New-user install gate (anonymous pull path)
     needs: [guard, publish]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    env:
-      # Same short-lived job token for gh (compose-file download) and for
-      # docker login below; no PAT, no account-wide secrets anywhere.
-      GH_TOKEN: ${{ github.token }}
+    permissions: {}
     steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Fresh-user install of THIS release: a brand-new directory holding
-      # only what a new user obtains per the README — the tagged
-      # docker-compose.yml (job-token gh api, no checkout) and a .env
-      # pinning the released X.Y.Z. The unique Compose project + trap'ed
+      # Fresh-user install of THIS release: only the public tagged
+      # docker-compose.yml and a .env pinning the released X.Y.Z.
+      # The unique Compose project + trap'ed
       # `down -v` guarantee cleanup removes ONLY this invocation's
       # containers, network, and project-prefixed netplot-data volume —
       # no globally named resources, no prune, nothing pre-existing.
@@ -392,6 +372,8 @@ jobs:
           tag="${{ needs.guard.outputs.image_tag }}"
           image="ghcr.io/${GITHUB_REPOSITORY}"
           gate_dir="$(mktemp -d "${RUNNER_TEMP}/netplot-install-gate.XXXXXX")"
+          export DOCKER_CONFIG="${gate_dir}/.docker"
+          mkdir -p "$DOCKER_CONFIG"
           project="netplot-install-gate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$$"
 
           cleanup() {
@@ -404,11 +386,10 @@ jobs:
 
           cd "$gate_dir"
 
-          # 1. The one file a new user needs, from THIS release tag, via
-          #    the job token (GH_TOKEN authenticates gh).
-          gh api -H "Accept: application/vnd.github.raw" \
-            "repos/${GITHUB_REPOSITORY}/contents/docker-compose.yml?ref=${GITHUB_REF_NAME}" \
-            > docker-compose.yml
+          # 1. Fetch THIS release's Compose file without authentication.
+          curl -fsSL --connect-timeout 10 --max-time 30 \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/docker-compose.yml" \
+            -o docker-compose.yml
           grep -q "ghcr.io/${GITHUB_REPOSITORY}" docker-compose.yml \
             || { echo "::error::tagged docker-compose.yml does not reference ${image}"; exit 1; }
 
@@ -423,12 +404,13 @@ jobs:
 
           compose=(docker compose --project-name "$project" --project-directory "$gate_dir" -f "${gate_dir}/docker-compose.yml")
 
-          # 3. Authenticated pull of exactly what was just published: the
+          # 3. Anonymous pull of exactly what was just published: the
           #    pulled image's RepoDigest must be the tag's manifest-list
-          #    digest (what a logged-in new user gets).
+          #    digest. The latest alias must also be publicly readable.
           published_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${image}:${tag}")"
           arches="$(docker buildx imagetools inspect --format '{{json .Manifest.Manifests}}' "${image}:${tag}" \
             | jq -r '[.[] | "\(.platform.os)/\(.platform.architecture)"] | sort | join(", ")')"
+          docker buildx imagetools inspect "${image}:latest" >/dev/null
           timeout 600 "${compose[@]}" pull
           docker image inspect --format '{{json .RepoDigests}}' "${image}:${tag}" \
             | jq -e --arg want "${image}@${published_digest}" 'index($want) != null' >/dev/null \
@@ -459,85 +441,12 @@ jobs:
           jq -e '.status == "ok" and (.persistence // "") != "degraded"' >/dev/null <<<"$health" \
             || { echo "::error::unexpected /healthz body: ${health}"; exit 1; }
 
-          echo "consumer gate: fresh-user install of ${image}:${tag} (${published_digest}; ${arches}) healthy at ${publish}"
+          echo "consumer gate: anonymous install of ${image}:${tag} (${published_digest}; ${arches}) healthy at ${publish}; latest manifest publicly readable"
           {
             echo "GATE_DIGEST=${published_digest}"
             echo "GATE_ARCHES=${arches}"
             echo "GATE_RESULT=pass (compose pull+up --wait, /healthz ok, binding ${publish})"
           } >> "$GITHUB_ENV"
-
-      # The package must still be PRIVATE. Two independent signals, both
-      # restricted to this repository's own image/package paths — never
-      # an organization or account-wide listing:
-      #   a) Authoritative GitHub package metadata, best-effort: a 403/404
-      #      from the packages API is not an error (the job token may not
-      #      read it); the registry probe below stays authoritative.
-      #   b) An explicit anonymous-registry denial probe: with NO
-      #      credentials anywhere in the flow, the anonymous token +
-      #      manifest fetch must be DENIED. HTTP 200 means the package
-      #      leaked public; network-level failures are indeterminate and
-      #      FAIL the gate (never treated as proof of privacy). The
-      #      authenticated `docker compose pull` that just succeeded in
-      #      the step above is the pairing that rules out "registry is
-      #      just down". Visibility is only read — never flipped.
-      - name: Verify the package is not anonymously pullable
-        run: |
-          set -euo pipefail
-
-          tag="${{ needs.guard.outputs.image_tag }}"
-          image_path="${GITHUB_REPOSITORY}"        # ghcr.io/<owner>/<image> for this repo
-          package_name="${GITHUB_REPOSITORY##*/}"  # container package name in the Packages API
-
-          # (a) Authoritative metadata for exactly this package.
-          if vis="$(gh api "users/${GITHUB_REPOSITORY_OWNER}/packages/container/${package_name}" --jq '.visibility' 2>/dev/null)" && [ -n "$vis" ]; then
-            if [ "$vis" = "public" ]; then
-              echo "::error::GitHub package metadata reports visibility=public for ${package_name}"
-              exit 1
-            fi
-            privacy_note="GitHub metadata: visibility=${vis}"
-            echo "privacy: package metadata says visibility=${vis}"
-          else
-            privacy_note="GitHub metadata: not readable by job token (registry probe authoritative)"
-            echo "privacy: packages metadata API not readable by this job token; relying on the anonymous registry probe"
-          fi
-
-          # (b) Anonymous registry denial probe (curl only — no docker
-          #     credentials, no job token, nothing persisted).
-          accept="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
-          token_file="${RUNNER_TEMP}/anon-ghcr-token.json"
-          for ref in "$tag" latest; do
-            token_code="$(curl -sS -o "$token_file" -w '%{http_code}' --connect-timeout 10 --max-time 30 \
-              "https://ghcr.io/token?service=ghcr.io&scope=repository:${image_path}:pull")" \
-              || { echo "::error::anonymous token request failed at network level — cannot verify privacy of ${image_path}:${ref}; refusing to pass"; exit 1; }
-            case "$token_code" in
-              200)
-                token="$(jq -r '.token // empty' "$token_file")"
-                [ -n "$token" ] || { echo "::error::anonymous token response malformed for ${image_path}:${ref}; refusing to pass"; exit 1; }
-                code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 \
-                  -H "Authorization: Bearer ${token}" -H "Accept: ${accept}" \
-                  "https://ghcr.io/v2/${image_path}/manifests/${ref}")" \
-                  || { echo "::error::anonymous manifest request failed at network level — cannot verify privacy of ${image_path}:${ref}; refusing to pass"; exit 1; }
-                case "$code" in
-                  200) echo "::error::${image_path}:${ref} answered HTTP 200 to a credential-free manifest fetch — the package is PUBLICLY PULLABLE"; exit 1 ;;
-                  401|403|404) echo "privacy: anonymous pull of ${image_path}:${ref} denied (manifest HTTP ${code})" ;;
-                  *) echo "::error::anonymous probe of ${image_path}:${ref} inconclusive (manifest HTTP ${code}) — not proof of privacy; refusing to pass"; exit 1 ;;
-                esac
-                ;;
-              401|403|404)
-                # Denied already at token issuance: no anonymous pull is
-                # possible (the authenticated pull above proves the path
-                # itself is valid, so this is a real denial, not a typo).
-                echo "privacy: anonymous pull of ${image_path}:${ref} denied (token issuance HTTP ${token_code})"
-                ;;
-              *)
-                echo "::error::anonymous token request for ${image_path}:${ref} inconclusive (HTTP ${token_code}) — not proof of privacy; refusing to pass"
-                exit 1
-                ;;
-            esac
-          done
-          rm -f "$token_file"
-          privacy_note="${privacy_note}; anonymous pull of :${tag} and :latest denied; authenticated compose pull succeeded"
-          echo "PRIVACY_NOTE=${privacy_note}" >> "$GITHUB_ENV"
 
       - name: Record release summary
         run: |
@@ -548,5 +457,5 @@ jobs:
             echo "- Manifest digest: ${GATE_DIGEST}"
             echo "- Architectures: ${GATE_ARCHES}"
             echo "- New-user install gate: ${GATE_RESULT}"
-            echo "- Privacy: ${PRIVACY_NOTE}"
+            echo "- Anonymous access: versioned Compose pull and latest manifest verified without registry credentials"
           } >> "$GITHUB_STEP_SUMMARY"

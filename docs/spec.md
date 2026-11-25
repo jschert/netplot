@@ -1286,14 +1286,15 @@ at the repo root).
 - **Build inputs**: `pyproject.toml`, `uv.lock`, `README.md`, `LICENSE`, and
   `src/` are copied into the build stage. `.dockerignore` excludes tests,
   docs, screenshots, caches, and the local venv from the build context.
-- **Published images**: ``ghcr.io/jschert/netplot`` is **private** and
+- **Published images**: ``ghcr.io/jschert/netplot`` is **public** and
   multi-arch (``linux/amd64`` + ``linux/arm64``). Each stable ``vX.Y.Z``
   tag publishes image tag ``X.Y.Z``; ``latest`` is moved only after
   checks and runtime smoke of both architectures succeed. The publisher
   verifies and loads the exact checksummed image artifacts that passed
   smoke, without rebuilding, then assembles consumer manifests by digest.
-  Pulls require ``docker login ghcr.io`` (``read:packages``) — see the
-  README Quick Start for the authenticated install path.
+  Pulls require no GitHub account or registry login. The release consumer
+  gate uses a fresh Docker configuration to verify anonymous installation
+  and access to ``latest`` — see the README Quick Start.
 - **Convenience runner**: ``docker-compose.yml`` has no ``build:``
   stanza — it pulls ``ghcr.io/jschert/netplot:${NETPLOT_VERSION:-latest}``
   and maps

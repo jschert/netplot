@@ -1,8 +1,7 @@
 # End-user Compose file: PULLS the published image from GHCR.
 #
 # Nothing is built here — no source checkout, Git, or Python toolchain is
-# needed. The image is private, so a one-time `docker login ghcr.io` is
-# required; see the README "Quick Start" for the authenticated setup.
+# needed. The image is public; no GitHub account or registry login is required.
 #
 #   docker compose up -d
 #

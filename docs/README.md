@@ -246,8 +246,8 @@ PURE additions, all node-asserted: `legendMax`, `legendMarkerPercent`,
 
 End-user installation no longer builds anything. `docker-compose.yml`
 has no `build:` stanza — it pulls
-`ghcr.io/jschert/netplot:${NETPLOT_VERSION:-latest}` (private image;
-requires a `read:packages` `docker login ghcr.io`), maps
+`ghcr.io/jschert/netplot:${NETPLOT_VERSION:-latest}` (public image;
+no registry login required), maps
 `${NETPLOT_BIND_ADDRESS:-127.0.0.1}:${NETPLOT_PORT:-8000}:8000`
 (loopback default — the app is unauthenticated), and keeps
 `restart: unless-stopped` plus the `netplot-data` named volume at
@@ -257,6 +257,6 @@ explicit `compose.build.yml` override, merged as
 `docker compose -f docker-compose.yml -f compose.build.yml up -d
 --build` (adds `build: .`, retags `netplot:dev` instead of the ghcr.io
 image — Compose scalar-merge replaces `image:`). The README Quick
-Start documents the public, version-pinned Compose download and the
-authenticated private-image pull separately. Source checkout and native
-installation need no GitHub login; GHCR pulls still require package access.
+Start documents a direct `docker run` and the version-pinned Compose path.
+Source downloads, native installs, and published-image pulls need no
+GitHub account or registry login.

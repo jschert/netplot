@@ -6,11 +6,8 @@ CSV export, and Prometheus metrics.
 
 ![Netplot dashboard showing per-hop latency, packet loss, and a live timeline](docs/netplot-dashboard.png)
 
-> **Public source; private prebuilt images.** This repository can be browsed,
-> cloned, and downloaded without authentication. The container image
-> (`ghcr.io/jschert/netplot`) remains **private**: pulling it requires package
-> access and a credential with `read:packages`. Native installs and local
-> source builds do not require registry access.
+> **Public source and prebuilt images.** Download and run
+> `ghcr.io/jschert/netplot` without a GitHub account, token, or registry login.
 
 ## Features
 
@@ -97,67 +94,38 @@ Keep third-party license and copyright notices intact.
 ## Quick Start (Docker)
 
 Requirements: Docker (Engine 24+ with the Compose v2 plugin, or Docker
-Desktop), package access, and a `read:packages` credential for the private
-image. The [GitHub CLI](https://cli.github.com/) (`gh`) is optional if you
-use the dedicated-token login below. No Git checkout, Python, or build
+Desktop). No GitHub account, registry login, Git checkout, Python, or build
 toolchain is needed.
 The command examples use Bash (Linux/macOS, or WSL/Git Bash on Windows).
 
-### 1. One-time: authenticate to GHCR
+For a single-command install:
 
 ```bash
-GH_BROWSER=true BROWSER=true gh auth login --hostname github.com --git-protocol https --web --scopes read:packages
+docker run -d --name netplot --restart unless-stopped \
+  -p 127.0.0.1:8000:8000 \
+  -v netplot-data:/data \
+  ghcr.io/jschert/netplot:latest
 ```
 
-The command prints a one-time device code and URL. Open that URL yourself
-and enter the displayed code; the `true` browser command prevents automatic
-browser launches. This device code is not a personal access token.
+Open **http://127.0.0.1:8000**. Docker pulls the image automatically.
 
-This requests the usual source-repository access plus `read:packages` for
-private GHCR pulls. If you were already logged in without that scope, add it
-once with `GH_BROWSER=true BROWSER=true gh auth refresh --hostname github.com --scopes read:packages`.
-Then pass the token to Docker through stdin, not as a command-line argument:
+Or use Compose for a version-pinned installation:
 
-```bash
-gh auth token --hostname github.com | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
-```
-
-Docker stores the credential in its configured credential helper, or as
-recoverable base64 in `~/.docker/config.json` when no helper is configured.
-The CLI token may also grant repository access or other permissions beyond
-image pulls. Prefer a dedicated `read:packages`-only token below when you
-want a least-privilege Docker credential.
-
-Replace `YOUR_GITHUB_USERNAME` with your own GitHub login. Alternatively,
-enter a classic personal access token with `read:packages` at a hidden
-Bash prompt, without putting its value in shell history:
-
-```bash
-read -r -s -p "GHCR token: " GHCR_TOKEN
-printf '\n'
-printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
-unset GHCR_TOKEN
-```
-
-Never commit real tokens, and never pipe a remote script into a shell —
-the commands here only use your own local `gh`/`docker` binaries.
-
-### 2. Download the Compose file (version-pinned)
+### 1. Download the Compose file
 
 ```bash
 mkdir netplot && cd netplot
-curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.4/docker-compose.yml \
+curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.5/docker-compose.yml \
   -o docker-compose.yml
-printf 'NETPLOT_VERSION=0.1.4\n' > .env
+printf 'NETPLOT_VERSION=0.1.5\n' > .env
 ```
 
-The Compose file and image are both pinned to the `v0.1.4` release; `.env`
+The Compose file and image are both pinned to the `v0.1.5` release; `.env`
 keeps the selected image version across later commands. Substitute another
 published stable `vX.Y.Z` tag and matching `X.Y.Z` image version if desired.
-Downloading the Compose file needs no GitHub login; pulling the private
-image still requires the registry authentication above.
+Both the Compose file and image download without authentication.
 
-### 3. Start
+### 2. Start
 
 ```bash
 docker compose up -d
@@ -165,9 +133,8 @@ docker compose up -d
 
 Open **http://127.0.0.1:8000**, enter a target (DNS name or IP), pick an
 interval, and press the green **Play** button. The first start pulls
-`ghcr.io/jschert/netplot:0.1.4` for your host (`linux/amd64` or
-`linux/arm64`). A `denied`/`not found` error means either your account
-lacks access or the selected tag is unavailable.
+`ghcr.io/jschert/netplot:0.1.5` for your host (`linux/amd64` or
+`linux/arm64`).
 
 ### Configuration
 
@@ -176,7 +143,7 @@ in a `.env` file next to it to make them stick:
 
 | Variable                | Default                     | Purpose                                                                   |
 | ----------------------- | --------------------------- | ------------------------------------------------------------------------- |
-| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.4`                                           |
+| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.5`                                           |
 | `NETPLOT_BIND_ADDRESS`  | `127.0.0.1`                 | Host interface the published port binds to                                |
 | `NETPLOT_PORT`          | `8000`                      | Host port                                                                 |
 | `NETPLOT_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1`   | Extra exact Host values to accept, e.g. `netplot.example` (see *LAN access*) |
@@ -184,7 +151,7 @@ in a `.env` file next to it to make them stick:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.4
+NETPLOT_VERSION=0.1.5
 NETPLOT_BIND_ADDRESS=127.0.0.1
 NETPLOT_PORT=8000
 ```
@@ -307,7 +274,7 @@ next to `docker-compose.yml` and they apply on every `docker compose up -d`:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.4
+NETPLOT_VERSION=0.1.5
 NETPLOT_ALLOWED_HOSTS=netplot.example
 FORWARDED_ALLOW_IPS=192.0.2.10
 ```
@@ -345,7 +312,7 @@ docker run -d --name netplot \
   -p 127.0.0.1:8000:8000 \
   -v netplot-data:/data \
   --restart unless-stopped \
-  ghcr.io/jschert/netplot:0.1.4
+  ghcr.io/jschert/netplot:0.1.5
 ```
 
 ## Route-origin caveat (containers)
@@ -587,13 +554,14 @@ for the packaging contract.
   `X.Y.Z` and `latest` multi-architecture manifests from immutable image
   digests. Stable release runs are serialized; consumer tags move only after
   all test and smoke jobs pass.
-- A final new-user gate downloads only the tagged Compose file, pulls the
-  private release with the job's short-lived `GITHUB_TOKEN`, starts it on
-  loopback, and verifies health and image identity. Anonymous pulls must
-  remain denied. The Release run summary records the digest and results.
-- The source repository is **public**; the GHCR package remains **private**.
-  Nothing automates package visibility changes. The Compose file downloads
-  anonymously; image pulls require package access and a `read:packages` login.
+- A final new-user gate downloads only the tagged Compose file and pulls
+  the public release with a fresh, credential-free Docker configuration.
+  It verifies health, image identity, the loopback binding, and anonymous
+  access to `latest`. The Release run summary records the digest and results.
+- The source repository and GHCR package must both be **public**. For a new
+  package, set its visibility to Public in GitHub's package settings before
+  the consumer gate can pass. Publishing requires the workflow's short-lived
+  `GITHUB_TOKEN`; installing requires no GitHub account or registry login.
 
 ## Layout
 
