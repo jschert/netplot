@@ -23,7 +23,8 @@
 #
 # Publishing gates (publish needs all of these):
 #   - guard: the tag is a stable vX.Y.Z (no -rc/-beta suffixes; non-stable
-#     vX.Y.Z-* tags run tests + smoke but never publish).
+#     vX.Y.Z-* tags run tests + smoke but never publish), and for stable
+#     tags the package version and README install pins name that release.
 #   - test: the full Python + JS suite.
 #   - build-and-smoke: BOTH architectures' images passed the runtime
 #     smoke (health, static assets, real loopback ping through the API,
@@ -85,6 +86,32 @@ jobs:
             echo "stable=false" >> "$GITHUB_OUTPUT"
             echo "'${ref}' is not a stable vX.Y.Z tag; tests and smoke will run, nothing will be published."
           fi
+
+      # A release must not ship stale version references: fail here, before
+      # anything is built, if the tag, the package version, or the README
+      # install examples disagree.
+      - name: Check out source
+        if: steps.tag.outputs.stable == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Release references match the tag
+        if: steps.tag.outputs.stable == 'true'
+        run: |
+            set -euo pipefail
+            tag="${{ steps.tag.outputs.image_tag }}"  # X.Y.Z
+            ref="${GITHUB_REF_NAME}"                  # vX.Y.Z
+            mismatch() { echo "::error::$1"; exit 1; }
+            grep -q "^version = \"${tag}\"$" pyproject.toml \
+              || mismatch "pyproject.toml version is not ${tag}"
+            grep -A1 '^name = "netplot"$' uv.lock | grep -q "^version = \"${tag}\"$" \
+              || mismatch "uv.lock does not pin netplot ${tag}"
+            grep -q "^__version__ = \"${tag}\"$" src/netplot/__init__.py \
+              || mismatch "src/netplot/__init__.py __version__ is not ${tag}"
+            for pinned in "netplot/${ref}/docker-compose.yml" "NETPLOT_VERSION=${tag}" "netplot:${tag}"; do
+              grep -qF "${pinned}" README.md \
+                || mismatch "README.md install examples do not reference ${pinned}"
+            done
+            echo "release references match ${ref}"
 
   test:
     name: Python + JS checks

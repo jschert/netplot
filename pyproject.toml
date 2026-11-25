@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netplot"
-version = "0.1.5"
-description = "Network plotting and visualization tools"
+version = "0.1.6"
+description = "PingPlotter-style network latency and packet-loss dashboard"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"

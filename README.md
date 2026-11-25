@@ -115,12 +115,12 @@ Or use Compose for a version-pinned installation:
 
 ```bash
 mkdir netplot && cd netplot
-curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.5/docker-compose.yml \
+curl -fsSL https://raw.githubusercontent.com/jschert/netplot/v0.1.6/docker-compose.yml \
   -o docker-compose.yml
-printf 'NETPLOT_VERSION=0.1.5\n' > .env
+printf 'NETPLOT_VERSION=0.1.6\n' > .env
 ```
 
-The Compose file and image are both pinned to the `v0.1.5` release; `.env`
+The Compose file and image are both pinned to the `v0.1.6` release; `.env`
 keeps the selected image version across later commands. Substitute another
 published stable `vX.Y.Z` tag and matching `X.Y.Z` image version if desired.
 Both the Compose file and image download without authentication.
@@ -133,7 +133,7 @@ docker compose up -d
 
 Open **http://127.0.0.1:8000**, enter a target (DNS name or IP), pick an
 interval, and press the green **Play** button. The first start pulls
-`ghcr.io/jschert/netplot:0.1.5` for your host (`linux/amd64` or
+`ghcr.io/jschert/netplot:0.1.6` for your host (`linux/amd64` or
 `linux/arm64`).
 
 ### Configuration
@@ -143,7 +143,7 @@ in a `.env` file next to it to make them stick:
 
 | Variable                | Default                     | Purpose                                                                   |
 | ----------------------- | --------------------------- | ------------------------------------------------------------------------- |
-| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.5`                                           |
+| `NETPLOT_VERSION`       | `latest`                    | Image tag to pull, e.g. `0.1.6`                                           |
 | `NETPLOT_BIND_ADDRESS`  | `127.0.0.1`                 | Host interface the published port binds to                                |
 | `NETPLOT_PORT`          | `8000`                      | Host port                                                                 |
 | `NETPLOT_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1`   | Extra exact Host values to accept, e.g. `netplot.example` (see *LAN access*) |
@@ -151,7 +151,7 @@ in a `.env` file next to it to make them stick:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.5
+NETPLOT_VERSION=0.1.6
 NETPLOT_BIND_ADDRESS=127.0.0.1
 NETPLOT_PORT=8000
 ```
@@ -274,7 +274,7 @@ next to `docker-compose.yml` and they apply on every `docker compose up -d`:
 
 ```dotenv
 # .env
-NETPLOT_VERSION=0.1.5
+NETPLOT_VERSION=0.1.6
 NETPLOT_ALLOWED_HOSTS=netplot.example
 FORWARDED_ALLOW_IPS=192.0.2.10
 ```
@@ -312,7 +312,7 @@ docker run -d --name netplot \
   -p 127.0.0.1:8000:8000 \
   -v netplot-data:/data \
   --restart unless-stopped \
-  ghcr.io/jschert/netplot:0.1.5
+  ghcr.io/jschert/netplot:0.1.6
 ```
 
 ## Route-origin caveat (containers)
@@ -544,8 +544,10 @@ for the packaging contract.
 ## Maintainer notes (releases)
 
 - After main-branch CI passes, push a stable `vX.Y.Z` tag matching the
-  package version. The initial release is `v0.1.0`; do not replace a
-  published release tag.
+  package version. The tag guard fails the release if the tag, the
+  `pyproject.toml` and `uv.lock` versions, `__version__`, or the README's
+  pinned install examples disagree. The initial release is `v0.1.0`; do
+  not replace a published release tag.
 - Release CI builds and runs real container smoke checks for `linux/amd64`
   and `linux/arm64`. It transfers the exact smoke-tested images as
   checksummed artifacts and verifies their identities before publication:

@@ -56,7 +56,7 @@ P2 — shipped in the Slice B work described below.)*
 The [coordinated implementation plan](plan-probing-history-scale.md) covers
 continuous TTL-aware probing, route-change history, durable measurement
 history, TCP/UDP modes, advanced probe controls, jitter, and larger target
-counts. These are planned changes, not capabilities of released v0.1.4.
+counts. These are planned changes, not capabilities of any released version.
 The current implementation and contracts below remain the baseline until
 the planned engine/storage cutover is implemented and verified.
 
